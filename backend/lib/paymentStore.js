@@ -1,46 +1,36 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { query } from './db.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = join(__dirname, '..', 'data');
-const ORDERS_FILE = join(DATA_DIR, 'orders.json');
-const SUBSCRIPTIONS_FILE = join(DATA_DIR, 'subscriptions.json');
+// ─── Helpers ─────────────────────────────────────────────
 
-function ensureDataDir() {
-  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+function rowToOrder(row) {
+  if (!row) return null;
+  return {
+    code: row.code,
+    userId: row.user_id,
+    userEmail: row.user_email,
+    planKey: row.plan_key,
+    period: row.period,
+    amount: row.amount,
+    status: row.status,
+    createdAt: row.created_at?.toISOString?.() || row.created_at,
+    paidAt: row.paid_at?.toISOString?.() || row.paid_at || null,
+    transactionId: row.transaction_id || null,
+    source: row.source || undefined,
+  };
 }
 
-function loadJson(filePath) {
-  try {
-    if (!existsSync(filePath)) return {};
-    return JSON.parse(readFileSync(filePath, 'utf-8'));
-  } catch {
-    return {};
-  }
-}
-
-function saveJson(filePath, data) {
-  ensureDataDir();
-  writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
-}
-
-// ─── Orders ──────────────────────────────────────────────
-
-let _orders = null;
-
-function getOrders() {
-  if (!_orders) _orders = loadJson(ORDERS_FILE);
-  return _orders;
-}
-
-function saveOrders() {
-  saveJson(ORDERS_FILE, _orders);
-}
-
-function isExpiredPendingOrder(order, maxAgeMs = 24 * 60 * 60 * 1000) {
-  if (!order || order.status !== 'pending') return false;
-  return Date.now() - new Date(order.createdAt).getTime() > maxAgeMs;
+function rowToSub(row) {
+  if (!row) return null;
+  return {
+    userId: row.user_id,
+    userEmail: row.user_email,
+    planKey: row.plan_key,
+    status: row.status,
+    startedAt: row.started_at?.toISOString?.() || row.started_at,
+    expiresAt: row.expires_at?.toISOString?.() || row.expires_at,
+    updatedAt: row.updated_at?.toISOString?.() || row.updated_at,
+    lastOrderCode: row.last_order_code || null,
+  };
 }
 
 let _orderCounter = 0;
@@ -59,206 +49,156 @@ function generateAdminOrderCode() {
   return `ADM${ts}${rand}${_orderCounter.toString().padStart(2, '0')}`;
 }
 
-export function createOrder({ userId, userEmail, planKey, period, amount }) {
-  const orders = getOrders();
+// ─── Orders ──────────────────────────────────────────────
+
+export async function createOrder({ userId, userEmail, planKey, period, amount }) {
   const code = generateOrderCode();
+  const now = new Date().toISOString();
 
-  const order = {
-    code,
-    userId,
-    userEmail,
-    planKey,
-    period,
-    amount,
-    status: 'pending',
-    createdAt: new Date().toISOString(),
-    paidAt: null,
-    transactionId: null,
-  };
+  const result = await query(
+    `INSERT INTO orders (code, user_id, user_email, plan_key, period, amount, status, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
+     RETURNING *`,
+    [code, userId, userEmail, planKey, period, amount, now],
+  );
 
-  orders[code] = order;
-  _orders = orders;
-  saveOrders();
-  return order;
+  return rowToOrder(result.rows[0]);
 }
 
-export function getOrder(code) {
-  const orders = getOrders();
-  const order = orders[code] || null;
+export async function getOrder(code) {
+  const result = await query('SELECT * FROM orders WHERE code = $1', [code]);
+  const order = rowToOrder(result.rows[0]);
   if (!order) return null;
 
-  if (isExpiredPendingOrder(order)) {
+  // Auto-expire pending orders older than 24h
+  if (order.status === 'pending' && Date.now() - new Date(order.createdAt).getTime() > 24 * 60 * 60 * 1000) {
+    await query("UPDATE orders SET status = 'expired' WHERE code = $1 AND status = 'pending'", [code]);
     order.status = 'expired';
-    _orders = orders;
-    saveOrders();
   }
 
   return order;
 }
 
-export function getOrdersByUser(userId) {
-  const orders = getOrders();
-  return Object.values(orders)
-    .filter((o) => o.userId === userId)
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+export async function getOrdersByUser(userId) {
+  const result = await query(
+    'SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC',
+    [userId],
+  );
+  return result.rows.map(rowToOrder);
 }
 
-export function markOrderPaid(code, transactionId) {
-  const orders = getOrders();
-  const order = orders[code];
-  if (!order || order.status !== 'pending') return null;
-
-  order.status = 'paid';
-  order.paidAt = new Date().toISOString();
-  order.transactionId = transactionId;
-  _orders = orders;
-  saveOrders();
-  return order;
+export async function markOrderPaid(code, transactionId) {
+  const now = new Date().toISOString();
+  const result = await query(
+    `UPDATE orders SET status = 'paid', paid_at = $2, transaction_id = $3
+     WHERE code = $1 AND status = 'pending'
+     RETURNING *`,
+    [code, now, transactionId],
+  );
+  return rowToOrder(result.rows[0]);
 }
 
-export function findPendingOrderByCode(transferContent) {
-  const orders = getOrders();
+export async function findPendingOrderByCode(transferContent) {
   const normalized = (transferContent || '').toUpperCase().replace(/\s+/g, '');
+  const result = await query("SELECT * FROM orders WHERE status = 'pending'");
 
-  for (const [code, order] of Object.entries(orders)) {
-    if (order.status !== 'pending') continue;
-    if (normalized.includes(code.toUpperCase())) return order;
+  for (const row of result.rows) {
+    if (normalized.includes(row.code.toUpperCase())) {
+      return rowToOrder(row);
+    }
   }
   return null;
 }
 
-export function cancelExpiredOrders(maxAgeMs = 24 * 60 * 60 * 1000) {
-  const orders = getOrders();
-  const now = Date.now();
-  let count = 0;
-
-  for (const order of Object.values(orders)) {
-    if (order.status !== 'pending') continue;
-    if (now - new Date(order.createdAt).getTime() > maxAgeMs) {
-      order.status = 'expired';
-      count++;
-    }
-  }
-
-  if (count > 0) {
-    _orders = orders;
-    saveOrders();
-  }
-  return count;
+export async function cancelExpiredOrders(maxAgeMs = 24 * 60 * 60 * 1000) {
+  const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+  const result = await query(
+    `UPDATE orders SET status = 'expired'
+     WHERE status = 'pending' AND created_at < $1`,
+    [cutoff],
+  );
+  return result.rowCount || 0;
 }
 
 // ─── Subscriptions ───────────────────────────────────────
-
-let _subs = null;
-
-function getSubs() {
-  if (!_subs) _subs = loadJson(SUBSCRIPTIONS_FILE);
-  return _subs;
-}
-
-function saveSubs() {
-  saveJson(SUBSCRIPTIONS_FILE, _subs);
-}
 
 const PLAN_DURATION = {
   monthly: 30,
   yearly: 365,
 };
 
-export function activateSubscription(order) {
-  const subs = getSubs();
+export async function activateSubscription(order) {
   const days = PLAN_DURATION[order.period] || 30;
-  const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+  const now = new Date();
+  const tierRank = { basic: 1, plus: 2, pro: 3 };
 
-  const existing = subs[order.userId];
+  // Check existing subscription
+  const existing = await query('SELECT * FROM subscriptions WHERE user_id = $1', [order.userId]);
+  const oldSub = existing.rows[0] ? rowToSub(existing.rows[0]) : null;
 
-  if (existing && existing.status === 'active' && new Date(existing.expiresAt) > new Date()) {
-    const tierRank = { basic: 1, plus: 2, pro: 3 };
+  if (oldSub && oldSub.status === 'active' && new Date(oldSub.expiresAt) > now) {
     const newRank = tierRank[order.planKey] ?? 0;
-    const oldRank = tierRank[existing.planKey] ?? 0;
+    const oldRank = tierRank[oldSub.planKey] ?? 0;
+    const currentEnd = new Date(oldSub.expiresAt);
+    const newExpiry = new Date(currentEnd.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+    const newPlan = newRank >= oldRank ? order.planKey : oldSub.planKey;
 
-    if (newRank >= oldRank) {
-      existing.planKey = order.planKey;
-      const currentEnd = new Date(existing.expiresAt);
-      existing.expiresAt = new Date(currentEnd.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
-      existing.updatedAt = new Date().toISOString();
-      existing.lastOrderCode = order.code;
-      _subs = subs;
-      saveSubs();
-      return existing;
-    } else {
-      const currentEnd = new Date(existing.expiresAt);
-      existing.expiresAt = new Date(currentEnd.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
-      existing.updatedAt = new Date().toISOString();
-      existing.lastOrderCode = order.code;
-      _subs = subs;
-      saveSubs();
-      return existing;
-    }
+    const result = await query(
+      `UPDATE subscriptions SET plan_key = $2, expires_at = $3, updated_at = $4, last_order_code = $5
+       WHERE user_id = $1
+       RETURNING *`,
+      [order.userId, newPlan, newExpiry, now.toISOString(), order.code],
+    );
+    return rowToSub(result.rows[0]);
   }
 
-  const sub = {
-    userId: order.userId,
-    userEmail: order.userEmail,
-    planKey: order.planKey,
-    status: 'active',
-    startedAt: new Date().toISOString(),
-    expiresAt,
-    updatedAt: new Date().toISOString(),
-    lastOrderCode: order.code,
-  };
-
-  subs[order.userId] = sub;
-  _subs = subs;
-  saveSubs();
-  return sub;
+  const expiresAt = new Date(now.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+  const result = await query(
+    `INSERT INTO subscriptions (user_id, user_email, plan_key, status, started_at, expires_at, updated_at, last_order_code)
+     VALUES ($1, $2, $3, 'active', $4, $5, $4, $6)
+     ON CONFLICT (user_id) DO UPDATE SET
+       user_email = $2, plan_key = $3, status = 'active', started_at = $4, expires_at = $5, updated_at = $4, last_order_code = $6
+     RETURNING *`,
+    [order.userId, order.userEmail, order.planKey, now.toISOString(), expiresAt, order.code],
+  );
+  return rowToSub(result.rows[0]);
 }
 
-export function getSubscription(userId) {
-  const subs = getSubs();
-  const sub = subs[userId];
+export async function getSubscription(userId) {
+  const result = await query('SELECT * FROM subscriptions WHERE user_id = $1', [userId]);
+  const sub = rowToSub(result.rows[0]);
   if (!sub) return null;
 
+  // Auto-expire
   if (sub.status === 'active' && new Date(sub.expiresAt) < new Date()) {
+    await query("UPDATE subscriptions SET status = 'expired' WHERE user_id = $1", [userId]);
     sub.status = 'expired';
-    _subs = subs;
-    saveSubs();
   }
 
   return sub;
 }
 
-export function getAllSubscriptions() {
-  return Object.values(getSubs());
+export async function getAllSubscriptions() {
+  const result = await query('SELECT * FROM subscriptions');
+  return result.rows.map(rowToSub);
 }
 
-export function getAllOrders() {
-  return Object.values(getOrders());
+export async function getAllOrders() {
+  const result = await query('SELECT * FROM orders ORDER BY created_at DESC');
+  return result.rows.map(rowToOrder);
 }
 
-export function grantAdminSubscription({ userId, userEmail, planKey, period, adminUsername = 'admin' }) {
-  const orders = getOrders();
+export async function grantAdminSubscription({ userId, userEmail, planKey, period, adminUsername = 'admin' }) {
   const now = new Date().toISOString();
   const code = generateAdminOrderCode();
 
-  const order = {
-    code,
-    userId,
-    userEmail,
-    planKey,
-    period,
-    amount: 0,
-    status: 'paid',
-    createdAt: now,
-    paidAt: now,
-    transactionId: `admin:${adminUsername}`,
-    source: 'admin',
-  };
+  await query(
+    `INSERT INTO orders (code, user_id, user_email, plan_key, period, amount, status, created_at, paid_at, transaction_id, source)
+     VALUES ($1, $2, $3, $4, $5, 0, 'paid', $6, $6, $7, 'admin')`,
+    [code, userId, userEmail, planKey, period, now, `admin:${adminUsername}`],
+  );
 
-  orders[code] = order;
-  _orders = orders;
-  saveOrders();
-
-  const subscription = activateSubscription(order);
+  const order = { code, userId, userEmail, planKey, period, amount: 0, status: 'paid', createdAt: now, paidAt: now, transactionId: `admin:${adminUsername}`, source: 'admin' };
+  const subscription = await activateSubscription(order);
   return { order, subscription };
 }

@@ -95,12 +95,12 @@ export function handleAdminLogin(req, res, body) {
   }
 }
 
-export function handleAdminStats(req, res) {
+export async function handleAdminStats(req, res) {
   if (!requireAdmin(req, res)) return;
 
-  const users = getAllUsers();
-  const subs = getAllSubscriptions();
-  const orders = getAllOrders();
+  const users = await getAllUsers();
+  const subs = await getAllSubscriptions();
+  const orders = await getAllOrders();
 
   const userIds = new Set(users.map((u) => u.userId));
   const subUserIds = new Set(subs.map((s) => s.userId));
@@ -140,12 +140,12 @@ export function handleAdminStats(req, res) {
   }));
 }
 
-export function handleAdminUsers(req, res) {
+export async function handleAdminUsers(req, res) {
   if (!requireAdmin(req, res)) return;
 
-  const users = getAllUsers();
-  const subs = getAllSubscriptions();
-  const orders = getAllOrders();
+  const users = await getAllUsers();
+  const subs = await getAllSubscriptions();
+  const orders = await getAllOrders();
 
   const userMap = {};
 
@@ -228,15 +228,15 @@ export function handleAdminUsers(req, res) {
   res.end(JSON.stringify({ ok: true, users: userRows }));
 }
 
-export function handleAdminOrders(req, res) {
+export async function handleAdminOrders(req, res) {
   if (!requireAdmin(req, res)) return;
 
-  const orders = getAllOrders().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const orders = (await getAllOrders()).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ok: true, orders }));
 }
 
-export function handleAdminGrantSubscription(req, res, body) {
+export async function handleAdminGrantSubscription(req, res, body) {
   if (!requireAdmin(req, res)) return;
 
   const { userId, userEmail, planKey, period } = body || {};
@@ -266,7 +266,7 @@ export function handleAdminGrantSubscription(req, res, body) {
   }
 
   const adminUsername = getAdminUsername(req);
-  const result = grantAdminSubscription({
+  const result = await grantAdminSubscription({
     userId: String(userId).trim(),
     userEmail: String(userEmail).trim(),
     planKey,
