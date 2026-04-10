@@ -1,9 +1,11 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { getAllSubscriptions, getAllOrders } from './paymentStore.js';
+import { getAllSubscriptions, getAllOrders, grantAdminSubscription } from './paymentStore.js';
 import { getAllUsers } from './userStore.js';
 
 const PLAN_LIMITS = { basic: 1, plus: 3, pro: 10 };
 const ACTIVE_WINDOW_MS = 10 * 60 * 1000;
+const VALID_PLAN_KEYS = new Set(['basic', 'plus', 'pro']);
+const VALID_PERIODS = new Set(['monthly', 'yearly']);
 
 // Default credentials — override via env vars
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
@@ -46,6 +48,19 @@ function verifyAdminToken(token) {
   }
 }
 
+function decodeAdminToken(token) {
+  if (!token || !token.includes('.')) return null;
+
+  const [payload] = token.split('.');
+  if (!payload) return null;
+
+  try {
+    return JSON.parse(Buffer.from(payload, 'base64url').toString('utf-8'));
+  } catch {
+    return null;
+  }
+}
+
 function isRecentlyActive(lastSeenAt) {
   if (!lastSeenAt) return false;
   return Date.now() - new Date(lastSeenAt).getTime() <= ACTIVE_WINDOW_MS;
@@ -60,6 +75,12 @@ function requireAdmin(req, res) {
     return false;
   }
   return true;
+}
+
+function getAdminUsername(req) {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  return decodeAdminToken(token)?.username || ADMIN_USERNAME;
 }
 
 export function handleAdminLogin(req, res, body) {
@@ -213,4 +234,51 @@ export function handleAdminOrders(req, res) {
   const orders = getAllOrders().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ok: true, orders }));
+}
+
+export function handleAdminGrantSubscription(req, res, body) {
+  if (!requireAdmin(req, res)) return;
+
+  const { userId, userEmail, planKey, period } = body || {};
+
+  if (!userId || !String(userId).trim()) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Thiếu userId để cấp gói.' }));
+    return;
+  }
+
+  if (!userEmail || !String(userEmail).trim()) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Thiếu email người dùng.' }));
+    return;
+  }
+
+  if (!VALID_PLAN_KEYS.has(planKey)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Gói không hợp lệ.' }));
+    return;
+  }
+
+  if (!VALID_PERIODS.has(period)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Kỳ hạn không hợp lệ.' }));
+    return;
+  }
+
+  const adminUsername = getAdminUsername(req);
+  const result = grantAdminSubscription({
+    userId: String(userId).trim(),
+    userEmail: String(userEmail).trim(),
+    planKey,
+    period,
+    adminUsername,
+  });
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    ok: true,
+    order: result.order,
+    subscription: result.subscription,
+    message: 'Đã cấp gói thành công.',
+  }));
 }

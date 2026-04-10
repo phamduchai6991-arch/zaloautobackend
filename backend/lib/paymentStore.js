@@ -52,6 +52,13 @@ function generateOrderCode() {
   return `AZ${ts}${rand}${_orderCounter.toString().padStart(2, '0')}`;
 }
 
+function generateAdminOrderCode() {
+  const ts = Date.now().toString(36).toUpperCase().slice(-5);
+  const rand = Math.random().toString(36).toUpperCase().slice(-1);
+  _orderCounter = (_orderCounter + 1) % 100;
+  return `ADM${ts}${rand}${_orderCounter.toString().padStart(2, '0')}`;
+}
+
 export function createOrder({ userId, userEmail, planKey, period, amount }) {
   const orders = getOrders();
   const code = generateOrderCode();
@@ -227,4 +234,31 @@ export function getAllSubscriptions() {
 
 export function getAllOrders() {
   return Object.values(getOrders());
+}
+
+export function grantAdminSubscription({ userId, userEmail, planKey, period, adminUsername = 'admin' }) {
+  const orders = getOrders();
+  const now = new Date().toISOString();
+  const code = generateAdminOrderCode();
+
+  const order = {
+    code,
+    userId,
+    userEmail,
+    planKey,
+    period,
+    amount: 0,
+    status: 'paid',
+    createdAt: now,
+    paidAt: now,
+    transactionId: `admin:${adminUsername}`,
+    source: 'admin',
+  };
+
+  orders[code] = order;
+  _orders = orders;
+  saveOrders();
+
+  const subscription = activateSubscription(order);
+  return { order, subscription };
 }

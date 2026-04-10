@@ -17,6 +17,7 @@ import {
   handleAdminUsers,
   handleAdminOrders,
   handleAdminLogin,
+  handleAdminGrantSubscription,
 } from './lib/adminHandlers.js';
 import { handleSyncUser } from './lib/userHandlers.js';
 
@@ -208,6 +209,11 @@ const server = createServer(async (req, res) => {
 
       if (req.method === 'GET' && url === '/api/admin/orders') {
         return handleAdminOrders(req, res);
+      }
+
+      if (req.method === 'POST' && url === '/api/admin/grant-subscription') {
+        const body = await readBody(req);
+        return handleAdminGrantSubscription(req, res, body);
       }
 
       return writeJson(res, 404, { ok: false, error: 'API endpoint không tồn tại.' });
