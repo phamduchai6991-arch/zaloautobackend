@@ -289,40 +289,20 @@ async function confirmAccountSync(requestId) {
     throw new Error('Yêu cầu đồng bộ tài khoản đã hết hạn hoặc không còn tồn tại.');
   }
 
-  const syncedAccount = pendingAccountSync.accountData;
-  const pendingWindowId = pendingAccountSync.windowId ?? incognitoWindowId;
-
   await broadcastSyncState('syncing_account', {
     requestId,
-    summary: buildAccountSummary(syncedAccount),
+    summary: buildAccountSummary(pendingAccountSync.accountData),
     error: '',
   });
 
-  await broadcastAccountData(syncedAccount);
+  await broadcastAccountData(pendingAccountSync.accountData);
 
-  const summary = buildAccountSummary(syncedAccount);
+  const summary = buildAccountSummary(pendingAccountSync.accountData);
   pendingAccountSync = null;
   await broadcastSyncState('ready', {
     requestId: null,
     summary,
     error: '',
-  });
-
-  Promise.resolve().then(async () => {
-    if (pendingWindowId != null) {
-      await closeIncognito(pendingWindowId);
-    }
-
-    try {
-      await ensureMessageActionTab(syncedAccount, {
-        interactive: false,
-        forceReset: true,
-      });
-    } catch (error) {
-      console.warn('[ZaloTool BG] Failed to warm action tab after sync:', error.message);
-    }
-  }).catch((error) => {
-    console.warn('[ZaloTool BG] Failed after account sync confirmation:', error.message);
   });
 
   return { ok: true, summary };
@@ -690,11 +670,12 @@ async function finalizePendingLogin(reason) {
   const windowId = tab?.windowId || incognitoWindowId;
   await stagePendingAccountSync(accountData, windowId);
 
-  // Keep the login window around only until the user confirms syncing this account.
+  // Keep the login window alive as the action tab for this account.
   if (windowId) {
     try {
       await windowsUpdate(windowId, { state: 'minimized', focused: false });
-      console.log('[ZaloTool BG] Incognito minimized while waiting for sync confirmation.');
+      messageActionTabId = pendingLoginTabId;
+      console.log('[ZaloTool BG] Incognito minimized, reused as action tab:', messageActionTabId);
     } catch (e) {
       await closeIncognito(windowId);
     }
@@ -720,12 +701,13 @@ async function handleZaloData(data, sender) {
   loginCompleted = true;
   await stagePendingAccountSync(accountData, sender.tab?.windowId);
 
-  // Keep the login window around only until the user confirms syncing this account.
+  // Keep the login window alive as the action tab for this account.
   const windowId = sender.tab?.windowId;
   if (windowId) {
     try {
       await windowsUpdate(windowId, { state: 'minimized', focused: false });
-      console.log('[ZaloTool BG] Incognito minimized while waiting for sync confirmation.');
+      messageActionTabId = sender.tab.id;
+      console.log('[ZaloTool BG] Incognito minimized, reused as action tab:', messageActionTabId);
     } catch (e) {
       console.warn('[ZaloTool BG] Failed to minimize, closing instead:', e.message);
       await closeIncognito(windowId);
@@ -942,7 +924,7 @@ async function waitForMatchingTabSession(tabId, account, maxAttempts = 8) {
 async function findMatchingZaloTab(account) {
   const allTabs = await tabsQuery({ url: 'https://chat.zalo.me/*' });
   for (const tab of allTabs) {
-    if (!tab?.id || tab.incognito || !tab.url?.includes('chat.zalo.me')) continue;
+    if (!tab?.id || !tab.url?.includes('chat.zalo.me')) continue;
 
     const session = await getTabSessionSnapshot(tab.id);
     if (sessionMatchesAccount(session, account)) {
@@ -986,7 +968,7 @@ async function ensureMessageActionTab(account, options = {}) {
   if (messageActionTabId != null) {
     try {
       const existing = await tabsGet(messageActionTabId);
-      if (!existing?.incognito && existing?.url?.includes('chat.zalo.me')) {
+      if (existing?.url?.includes('chat.zalo.me')) {
         if (!accountHasSessionIdentity(account)) {
           if (interactive) {
             await focusMessageActionTab(existing.id);
@@ -1160,9 +1142,20 @@ async function prepareAndRunMessageBatch(payload) {
   await ensureAccountReady(account, 'Batch nhắn tin');
 
   let tabId = await ensureMessageActionTab(account, { interactive: false });
-  const apiReady = await probeMessageApiReady(tabId);
+  let apiReady = await probeMessageApiReady(tabId);
+
+  // Retry a few times before giving up — avoids creating extra windows.
   if (!apiReady) {
-    tabId = await ensureMessageActionTab(account, { interactive: true });
+    await delay(3000);
+    apiReady = await probeMessageApiReady(tabId);
+  }
+  if (!apiReady) {
+    await focusMessageActionTab(tabId);
+    await delay(4000);
+    apiReady = await probeMessageApiReady(tabId);
+  }
+  if (!apiReady) {
+    throw new Error('Zalo API bridge chưa sẵn sàng. Hãy đồng bộ lại tài khoản rồi gửi lại.');
   }
   let response = null;
 
@@ -1246,6 +1239,7 @@ chrome.windows.onRemoved.addListener((windowId) => {
     clearPendingTimers();
     incognitoWindowId = null;
     pendingLoginTabId = null;
+    messageActionTabId = null;
 
     // Only notify "login cancelled" if login hadn't completed yet
     if (!loginCompleted) {
