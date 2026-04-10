@@ -10,6 +10,7 @@ let pendingReextractTimer = null;
 let pendingReextractCount = 0;
 let lastKnownLoginData = null;
 let messageActionTabId = null;
+let messageActionManagedWindowId = null;
 let loginCompleted = false;    // Track whether login succeeded before window closes
 let pendingAccountSync = null;
 let syncState = {
@@ -288,20 +289,40 @@ async function confirmAccountSync(requestId) {
     throw new Error('Yêu cầu đồng bộ tài khoản đã hết hạn hoặc không còn tồn tại.');
   }
 
+  const syncedAccount = pendingAccountSync.accountData;
+  const pendingWindowId = pendingAccountSync.windowId ?? incognitoWindowId;
+
   await broadcastSyncState('syncing_account', {
     requestId,
-    summary: buildAccountSummary(pendingAccountSync.accountData),
+    summary: buildAccountSummary(syncedAccount),
     error: '',
   });
 
-  await broadcastAccountData(pendingAccountSync.accountData);
+  await broadcastAccountData(syncedAccount);
 
-  const summary = buildAccountSummary(pendingAccountSync.accountData);
+  const summary = buildAccountSummary(syncedAccount);
   pendingAccountSync = null;
   await broadcastSyncState('ready', {
     requestId: null,
     summary,
     error: '',
+  });
+
+  Promise.resolve().then(async () => {
+    if (pendingWindowId != null) {
+      await closeIncognito(pendingWindowId);
+    }
+
+    try {
+      await ensureMessageActionTab(syncedAccount, {
+        interactive: false,
+        forceReset: true,
+      });
+    } catch (error) {
+      console.warn('[ZaloTool BG] Failed to warm action tab after sync:', error.message);
+    }
+  }).catch((error) => {
+    console.warn('[ZaloTool BG] Failed after account sync confirmation:', error.message);
   });
 
   return { ok: true, summary };
@@ -467,6 +488,7 @@ async function openIncognitoForLogin(payload = {}) {
   const mode = normalizeSyncMode(payload?.mode);
   // Close existing incognito first (ensures clean session)
   await closeIncognito();
+  await closeManagedMessageActionWindow();
   // Brief pause so Chrome clears the incognito session
   await delay(300);
   resetPendingSession();
@@ -668,12 +690,11 @@ async function finalizePendingLogin(reason) {
   const windowId = tab?.windowId || incognitoWindowId;
   await stagePendingAccountSync(accountData, windowId);
 
-  // Minimize instead of close — keep for API operations
+  // Keep the login window around only until the user confirms syncing this account.
   if (windowId) {
     try {
       await windowsUpdate(windowId, { state: 'minimized', focused: false });
-      messageActionTabId = pendingLoginTabId;
-      console.log('[ZaloTool BG] Incognito minimized (fallback), tab:', messageActionTabId);
+      console.log('[ZaloTool BG] Incognito minimized while waiting for sync confirmation.');
     } catch (e) {
       await closeIncognito(windowId);
     }
@@ -699,13 +720,12 @@ async function handleZaloData(data, sender) {
   loginCompleted = true;
   await stagePendingAccountSync(accountData, sender.tab?.windowId);
 
-  // Minimize the incognito window — keep it alive as API execution tab
+  // Keep the login window around only until the user confirms syncing this account.
   const windowId = sender.tab?.windowId;
   if (windowId) {
     try {
       await windowsUpdate(windowId, { state: 'minimized', focused: false });
-      messageActionTabId = sender.tab.id;
-      console.log('[ZaloTool BG] Incognito minimized for API use, tab:', messageActionTabId);
+      console.log('[ZaloTool BG] Incognito minimized while waiting for sync confirmation.');
     } catch (e) {
       console.warn('[ZaloTool BG] Failed to minimize, closing instead:', e.message);
       await closeIncognito(windowId);
@@ -772,6 +792,24 @@ async function clearRegularZaloCookies() {
       // Best-effort cleanup only.
     }
   }
+}
+
+async function closeManagedMessageActionWindow() {
+  const windowId = messageActionManagedWindowId;
+  messageActionManagedWindowId = null;
+  messageActionTabId = null;
+
+  if (windowId == null) {
+    return;
+  }
+
+  closingWindowIds.add(windowId);
+  try {
+    await windowsRemove(windowId);
+  } catch (_) {
+    // Best-effort cleanup only.
+  }
+  closingWindowIds.delete(windowId);
 }
 
 async function applyAccountCookies(account) {
@@ -904,7 +942,7 @@ async function waitForMatchingTabSession(tabId, account, maxAttempts = 8) {
 async function findMatchingZaloTab(account) {
   const allTabs = await tabsQuery({ url: 'https://chat.zalo.me/*' });
   for (const tab of allTabs) {
-    if (!tab?.id || !tab.url?.includes('chat.zalo.me')) continue;
+    if (!tab?.id || tab.incognito || !tab.url?.includes('chat.zalo.me')) continue;
 
     const session = await getTabSessionSnapshot(tab.id);
     if (sessionMatchesAccount(session, account)) {
@@ -937,12 +975,18 @@ async function focusMessageActionTab(tabId) {
 
 async function ensureMessageActionTab(account, options = {}) {
   const interactive = Boolean(options.interactive);
+  const forceReset = Boolean(options.forceReset);
 
-  // 1. Reuse existing API tab (from minimized incognito)
+  if (forceReset) {
+    await closeManagedMessageActionWindow();
+    messageActionTabId = null;
+  }
+
+  // 1. Reuse the current action tab if it still belongs to the selected account.
   if (messageActionTabId != null) {
     try {
       const existing = await tabsGet(messageActionTabId);
-      if (existing?.url?.includes('chat.zalo.me')) {
+      if (!existing?.incognito && existing?.url?.includes('chat.zalo.me')) {
         if (!accountHasSessionIdentity(account)) {
           if (interactive) {
             await focusMessageActionTab(existing.id);
@@ -970,6 +1014,7 @@ async function ensureMessageActionTab(account, options = {}) {
     const matchingTabId = await findMatchingZaloTab(account);
     if (matchingTabId != null) {
       messageActionTabId = matchingTabId;
+      messageActionManagedWindowId = null;
       if (interactive) {
         await focusMessageActionTab(matchingTabId);
       }
@@ -1002,6 +1047,7 @@ async function ensureMessageActionTab(account, options = {}) {
   }
 
   messageActionTabId = newTab.id;
+  messageActionManagedWindowId = win.id ?? null;
   await waitForTabComplete(newTab.id, 30000);
 
   const loaded = await tabsGet(newTab.id);
@@ -1016,6 +1062,7 @@ async function ensureMessageActionTab(account, options = {}) {
     const matched = await waitForMatchingTabSession(newTab.id, account);
     if (!matched) {
       messageActionTabId = null;
+      messageActionManagedWindowId = null;
       throw new Error('Tab Zalo thao tác không khớp với tài khoản đã chọn. Hãy đồng bộ lại tài khoản rồi thử lại.');
     }
   }
@@ -1048,6 +1095,18 @@ async function sendApiRequestToTab(tabId, request) {
   }
 
   return response.data || null;
+}
+
+async function probeMessageApiReady(tabId) {
+  try {
+    const probe = await sendApiRequestToTab(tabId, {
+      method: 'checkApiReady',
+      args: {},
+    });
+    return Boolean(probe?.ready);
+  } catch (_) {
+    return false;
+  }
 }
 
 async function getZaloCommonData(payload) {
@@ -1100,7 +1159,11 @@ async function prepareAndRunMessageBatch(payload) {
 
   await ensureAccountReady(account, 'Batch nhắn tin');
 
-  const tabId = await ensureMessageActionTab(account, { interactive: true });
+  let tabId = await ensureMessageActionTab(account, { interactive: false });
+  const apiReady = await probeMessageApiReady(tabId);
+  if (!apiReady) {
+    tabId = await ensureMessageActionTab(account, { interactive: true });
+  }
   let response = null;
 
   try {
@@ -1183,7 +1246,6 @@ chrome.windows.onRemoved.addListener((windowId) => {
     clearPendingTimers();
     incognitoWindowId = null;
     pendingLoginTabId = null;
-    messageActionTabId = null;
 
     // Only notify "login cancelled" if login hadn't completed yet
     if (!loginCompleted) {
@@ -1208,6 +1270,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     pendingLoginTabId = null;
   }
   if (tabId === messageActionTabId) {
+    messageActionTabId = null;
+  }
+});
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  if (windowId === messageActionManagedWindowId) {
+    messageActionManagedWindowId = null;
     messageActionTabId = null;
   }
 });
