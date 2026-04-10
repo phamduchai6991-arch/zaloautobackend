@@ -76,6 +76,12 @@ async function handleSendBatchStream(req, res, body) {
     'Cache-Control': 'no-cache',
   });
 
+  // Convert base64 files to Buffer attachments (shared across all jobs)
+  const rawFiles = Array.isArray(body?.files) ? body.files : [];
+  const attachments = rawFiles
+    .filter((f) => f && typeof f.name === 'string' && typeof f.data === 'string')
+    .map((f) => ({ data: Buffer.from(f.data, 'base64'), filename: f.name }));
+
   let accepted = 0;
   let failed = 0;
 
@@ -84,6 +90,7 @@ async function handleSendBatchStream(req, res, body) {
     const groupJob = isGroupJob(job);
     const zid = normalizeThreadId(job?.zid, groupJob);
     const content = String(job?.content || '').trim();
+    const hasAttachments = attachments.length > 0;
     const startedAt = new Date().toISOString();
 
     // Emit "running" status
@@ -106,7 +113,7 @@ async function handleSendBatchStream(req, res, body) {
       continue;
     }
 
-    if (!content) {
+    if (!content && !hasAttachments) {
       failed++;
       writeNdjsonLine(res, {
         jobId: job?.id, ok: false, status: 'failed',
@@ -119,7 +126,8 @@ async function handleSendBatchStream(req, res, body) {
 
     try {
       const threadType = groupJob ? ThreadType.Group : ThreadType.User;
-      const apiResult = await api.sendMessage(content, zid, threadType);
+      const msgPayload = hasAttachments ? { msg: content, attachments } : content;
+      const apiResult = await api.sendMessage(msgPayload, zid, threadType);
       accepted++;
       writeNdjsonLine(res, {
         jobId: job.id, ok: true, status: 'sent',
@@ -521,6 +529,50 @@ const server = createServer(async (req, res) => {
       if (req.method === 'POST' && url === '/api/zalo/actions/batch') {
         const body = await readBody(req);
         return handleActionBatch(req, res, body);
+      }
+
+      // ─── AI Rewrite (DeepSeek proxy) ───
+
+      if (req.method === 'POST' && url === '/api/ai/rewrite') {
+        const body = await readBody(req);
+        const text = String(body?.text || '').trim();
+        const target = body?.target || 'message'; // 'message' or 'friend'
+        if (!text) return writeJson(res, 400, { ok: false, error: 'Thiếu nội dung để viết lại.' });
+        const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || 'sk-6b3964ea846f4e1daabcf8f0c4000986';
+        const systemPrompt = target === 'friend'
+          ? 'Bạn là trợ lý viết lại tin nhắn kết bạn Zalo. Hãy viết lại nội dung sau thành 3 phiên bản khác nhau: 1 bản lịch sự chuyên nghiệp, 1 bản thân thiện gần gũi, 1 bản ngắn gọn súc tích. Mỗi bản tối đa 150 ký tự. Trả về JSON array gồm 3 string, không giải thích thêm.'
+          : 'Bạn là trợ lý viết lại tin nhắn Zalo. Hãy viết lại nội dung sau thành 3 phiên bản khác nhau: 1 bản lịch sự chuyên nghiệp, 1 bản thân thiện gần gũi, 1 bản ngắn gọn súc tích. Trả về JSON array gồm 3 string, không giải thích thêm.';
+        try {
+          const resp = await fetch('https://api.deepseek.com/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${DEEPSEEK_API_KEY}` },
+            body: JSON.stringify({
+              model: 'deepseek-chat',
+              messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: text },
+              ],
+              temperature: 0.8,
+            }),
+          });
+          if (!resp.ok) {
+            const errText = await resp.text();
+            return writeJson(res, 502, { ok: false, error: `DeepSeek API error: ${resp.status}`, detail: errText });
+          }
+          const data = await resp.json();
+          const raw = data?.choices?.[0]?.message?.content || '[]';
+          let options;
+          try {
+            // Extract JSON array from response (may be wrapped in markdown code block)
+            const jsonMatch = raw.match(/\[[\s\S]*\]/);
+            options = jsonMatch ? JSON.parse(jsonMatch[0]) : [raw];
+          } catch (_) {
+            options = [raw];
+          }
+          return writeJson(res, 200, { ok: true, options });
+        } catch (error) {
+          return writeJson(res, 502, { ok: false, error: error instanceof Error ? error.message : 'DeepSeek API unreachable.' });
+        }
       }
 
       return writeJson(res, 404, { ok: false, error: 'API endpoint không tồn tại.' });
