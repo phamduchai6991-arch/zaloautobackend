@@ -1,0 +1,19 @@
+services:
+  - type: web
+    runtime: node
+    name: autozalo-backend
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_SECRET
+        sync: false
+      - key: SEPAY_API_KEY
+        sync: false
+      - key: ZALOWEB_ALLOWED_ORIGINS
+        sync: false

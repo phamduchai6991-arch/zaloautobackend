@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { readFileSync, existsSync, statSync } from 'node:fs';
-import { join, dirname, extname } from 'node:path';
+import { join, dirname, extname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   handleCreateOrder,
@@ -37,20 +37,36 @@ if (existsSync(envPath)) {
 }
 
 const PORT = Number(process.env.PORT || 3000);
-const DIST_DIR = join(__dirname, '..', 'frontend', 'dist');
+const configuredDistDir = process.env.FRONTEND_DIST_DIR?.trim();
+const DIST_DIR = configuredDistDir
+  ? (isAbsolute(configuredDistDir)
+      ? configuredDistDir
+      : resolve(__dirname, configuredDistDir))
+  : join(__dirname, '..', 'frontend', 'dist');
+const HAS_DIST = existsSync(join(DIST_DIR, 'index.html'));
 
 // ─── CORS ────────────────────────────────────────────────
 
-const ALLOWED_ORIGINS = [
+const DEFAULT_ALLOWED_ORIGINS = [
   'https://autozalo.vn',
   'https://www.autozalo.vn',
   'http://localhost:3001',
   'http://127.0.0.1:3001',
 ];
 
+const ALLOWED_ORIGINS = new Set([
+  ...DEFAULT_ALLOWED_ORIGINS,
+  ...(process.env.ZALOWEB_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+]);
+
 function setCors(req, res) {
   const origin = req.headers.origin || '';
-  if (ALLOWED_ORIGINS.includes(origin)) {
+  if (ALLOWED_ORIGINS.has('*')) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (ALLOWED_ORIGINS.has(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
@@ -75,6 +91,20 @@ const MIME = {
 };
 
 function serveStatic(res, urlPath) {
+  if (!HAS_DIST) {
+    if (urlPath === '/') {
+      return writeJson(res, 200, {
+        ok: true,
+        service: 'autozalo-backend',
+        mode: 'api-only',
+      });
+    }
+
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Frontend build not deployed on this service.');
+    return;
+  }
+
   // Prevent path traversal
   const safePath = urlPath.replace(/\.\./g, '').replace(/\/\//g, '/');
   let filePath = join(DIST_DIR, safePath === '/' ? 'index.html' : safePath);
@@ -195,7 +225,9 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`[autozalo-backend] listening on http://0.0.0.0:${PORT}`);
-  console.log(`[autozalo-backend] Serving frontend from: ${DIST_DIR}`);
+  console.log(`[autozalo-backend] Frontend mode: ${HAS_DIST ? 'static bundle' : 'api-only'}`);
+  console.log(`[autozalo-backend] Frontend path: ${DIST_DIR}`);
+  console.log(`[autozalo-backend] Allowed origins: ${Array.from(ALLOWED_ORIGINS).join(', ') || '(none)'}`);
   console.log(`[autozalo-backend] SePay webhook: POST /api/payment/webhook/sepay`);
 
   // Cleanup expired orders every hour
