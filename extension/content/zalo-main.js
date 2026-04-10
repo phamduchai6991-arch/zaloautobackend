@@ -1,0 +1,1286 @@
+/* Runs in MAIN world at document_start on chat.zalo.me
+   Waits for $$afmc.zStorage, extracts decrypted friend/group data,
+   dispatches it to the ISOLATED content script via CustomEvent,
+   and exposes a webpack API bridge for direct Zalo API calls.
+   Also intercepts WebSocket to forward incoming messages in real-time. */
+
+(function () {
+  'use strict';
+
+  var MAX_WAIT = 150; // 150 × 1s = 2.5 min
+  var INITIAL_EXTRACT_DELAY = 2500;
+  var EXTRACTION_RETRIES = 6;
+  var EXTRACTION_RETRY_DELAY = 1500;
+  var attempt = 0;
+
+  // === Webpack API Bridge state ===
+  var _wr = null;          // webpack __webpack_require__
+  var _httpModule = null;      // fBUP.default
+  var _businessModule = null;  // dThN.default
+  var _apiReady = false;
+
+  function dispatch(type, payload) {
+    window.dispatchEvent(new CustomEvent('__zalotool__', {
+      detail: JSON.stringify({ type: type, data: payload }),
+    }));
+  }
+
+  // ============================================================
+  // === WebSocket Interceptor for Real-Time Messages ===
+  // ============================================================
+
+  // Parse Zalo's binary WebSocket frame header: [version(1byte), cmd(3bytes LE), subCmd(1byte)]
+  function parseWsHeader(buffer) {
+    if (buffer.byteLength < 4) return null;
+    var view = new DataView(buffer instanceof ArrayBuffer ? buffer : buffer.buffer);
+    var version = view.getUint8(0);
+    var cmd = view.getInt32(1, true); // little-endian, 3 bytes read as int32
+    var subCmd = view.getInt8(3);
+    return { version: version, cmd: cmd, subCmd: subCmd };
+  }
+
+  function tryParseWsMessage(data) {
+    try {
+      var buffer;
+      if (data instanceof ArrayBuffer) {
+        buffer = data;
+      } else if (data instanceof Blob) {
+        return null; // Can't sync-parse Blob - skip (rare)
+      } else if (typeof data === 'string') {
+        return null; // Text frames not used by Zalo for messages
+      } else if (data && data.buffer) {
+        buffer = data.buffer;
+      } else {
+        return null;
+      }
+
+      if (buffer.byteLength < 5) return null;
+
+      var header = parseWsHeader(buffer);
+      if (!header || header.version !== 1) return null;
+
+      // Only intercept message commands
+      // cmd 501 = 1:1 user messages, cmd 521 = group messages
+      if (header.cmd !== 501 && header.cmd !== 521) return null;
+      if (header.subCmd !== 0) return null;
+
+      var bodyBytes = new Uint8Array(buffer, 4);
+      var bodyText = new TextDecoder('utf-8').decode(bodyBytes);
+      if (!bodyText || bodyText.length === 0) return null;
+
+      var parsed = JSON.parse(bodyText);
+      return { header: header, data: parsed };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function handleIncomingWsMessage(header, parsedData) {
+    try {
+      var messages = [];
+      var isGroup = header.cmd === 521;
+
+      if (header.cmd === 501 && parsedData.msgs) {
+        messages = parsedData.msgs;
+      } else if (header.cmd === 521 && parsedData.groupMsgs) {
+        messages = parsedData.groupMsgs;
+      }
+
+      if (!Array.isArray(messages) || messages.length === 0) return;
+
+      var normalized = [];
+      for (var i = 0; i < messages.length; i++) {
+        var msg = messages[i];
+        if (!msg || typeof msg !== 'object') continue;
+        // Skip undo/delete notifications
+        if (msg.content && typeof msg.content === 'object' && msg.content.deleteMsg) continue;
+
+        normalized.push({
+          msgId: String(msg.msgId || msg.globalMsgId || msg.actionId || msg.realMsgId || msg.cliMsgId || msg.id || ''),
+          fromId: String(msg.uidFrom || msg.fromUid || msg.fromId || msg.senderId || msg.uid || ''),
+          toId: String(msg.idTo || msg.toId || msg.toUid || ''),
+          content: extractMessageContent(msg) || '[Tin nhắn không có nội dung]',
+          ts: Number(msg.ts || 0),
+          msgType: msg.msgType || msg.type || 'text',
+          dName: msg.dName || '',
+          isGroup: isGroup,
+          threadId: isGroup
+            ? normalizeConversationId(msg.idTo || msg.toId || '', true)
+            : normalizeConversationId(msg.uidFrom === '0' ? (msg.idTo || msg.toId || '') : (msg.uidFrom || msg.fromUid || msg.fromId || '')),
+        });
+      }
+
+      if (normalized.length > 0) {
+        console.log('[ZaloMain] WS intercepted', normalized.length, isGroup ? 'group' : 'user', 'messages');
+        dispatch('incoming_messages', normalized);
+      }
+    } catch (err) {
+      console.warn('[ZaloMain] WS message parse error:', err.message);
+    }
+  }
+
+  // Monkey-patch WebSocket to intercept incoming messages
+  var _OrigWebSocket = window.WebSocket;
+  window.WebSocket = function ZaloWSInterceptor(url, protocols) {
+    var ws = protocols !== undefined
+      ? new _OrigWebSocket(url, protocols)
+      : new _OrigWebSocket(url);
+
+    // Only intercept Zalo's message WebSocket
+    if (url && url.indexOf('zalo.me') !== -1) {
+      var origOnMessage = null;
+
+      // Intercept .onmessage setter
+      Object.defineProperty(ws, 'onmessage', {
+        get: function () { return origOnMessage; },
+        set: function (fn) {
+          origOnMessage = function (event) {
+            // Try to intercept, but always pass through
+            var parsed = tryParseWsMessage(event.data);
+            if (parsed) {
+              handleIncomingWsMessage(parsed.header, parsed.data);
+            }
+            if (typeof fn === 'function') fn.call(ws, event);
+          };
+        },
+        configurable: true,
+      });
+
+      // Also intercept addEventListener('message', ...)
+      var origAddEventListener = ws.addEventListener.bind(ws);
+      ws.addEventListener = function (type, listener, options) {
+        if (type === 'message') {
+          var wrappedListener = function (event) {
+            var parsed = tryParseWsMessage(event.data);
+            if (parsed) {
+              handleIncomingWsMessage(parsed.header, parsed.data);
+            }
+            if (typeof listener === 'function') listener.call(ws, event);
+            else if (listener && typeof listener.handleEvent === 'function') listener.handleEvent(event);
+          };
+          return origAddEventListener(type, wrappedListener, options);
+        }
+        return origAddEventListener(type, listener, options);
+      };
+    }
+
+    return ws;
+  };
+  // Preserve prototype chain
+  window.WebSocket.prototype = _OrigWebSocket.prototype;
+  window.WebSocket.CONNECTING = _OrigWebSocket.CONNECTING;
+  window.WebSocket.OPEN = _OrigWebSocket.OPEN;
+  window.WebSocket.CLOSING = _OrigWebSocket.CLOSING;
+  window.WebSocket.CLOSED = _OrigWebSocket.CLOSED;
+
+  function delay(ms) {
+    return new Promise(function (resolve) {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  function withTimeout(promise, ms, fallbackValue) {
+    return new Promise(function (resolve) {
+      var settled = false;
+      var timeoutId = setTimeout(function () {
+        if (!settled) {
+          settled = true;
+          resolve(fallbackValue);
+        }
+      }, ms);
+
+      Promise.resolve(promise)
+        .then(function (value) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          resolve(value);
+        })
+        .catch(function () {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          resolve(fallbackValue);
+        });
+    });
+  }
+
+  function toArray(value) {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    if (value instanceof Map) return Array.from(value.values());
+    if (typeof value === 'object') return Object.values(value);
+    return [];
+  }
+
+  function dedupeBy(items, getKey) {
+    var seen = new Set();
+    return items.filter(function (item) {
+      var key = getKey(item);
+      if (!key) return true;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function normalizeFriend(friend) {
+    if (!friend) return null;
+    return {
+      userId: friend.userId || '',
+      username: friend.username || '',
+      displayName: friend.displayName || '',
+      zaloName: friend.zaloName || '',
+      avatar: friend.avatar || '',
+      gender: friend.gender,
+      dob: friend.dob,
+      sdob: friend.sdob || '',
+      status: friend.status || '',
+      phoneNumber: friend.phoneNumber || '',
+      isFr: friend.isFr,
+      isBlocked: friend.isBlocked,
+      isActive: friend.isActive,
+      globalId: friend.globalId || '',
+      type: friend.type,
+      user_mode: friend.user_mode,
+      bizInfo: friend.bizInfo || null,
+    };
+  }
+
+  function normalizeGroup(group) {
+    if (!group) return null;
+
+    var memberIds = group.memberIds || group.member_ids || group.members || group.participantIds || [];
+    var normalized = {
+      userId: group.userId || group.groupId || group.id || group.convId || group.conv_id || group.threadId || '',
+      displayName: group.displayName || group.groupName || group.group_name || group.name || group.title || '',
+      avatar: group.avatar || group.avatarUrl || group.avatar_hd || '',
+      totalMember: group.totalMember || group.memberCount || group.group_member_count || (Array.isArray(memberIds) ? memberIds.length : 0),
+      memberIds: Array.isArray(memberIds) ? memberIds : [],
+      creatorId: group.creatorId || group.ownerId || group.creator || '',
+      type: group.type,
+      subType: group.subType || group.groupType,
+      globalId: group.globalId || group.convId || group.conv_id || '',
+      desc: group.desc || group.description || group.groupDesc || '',
+    };
+
+    if (!normalized.userId && !normalized.globalId && !normalized.displayName) return null;
+    return normalized;
+  }
+
+  function openIndexedDb(name, version) {
+    return new Promise(function (resolve, reject) {
+      var request = indexedDB.open(name, version);
+      request.onsuccess = function (event) {
+        resolve(event.target.result);
+      };
+      request.onerror = function () {
+        reject(request.error || new Error('Failed to open IndexedDB'));
+      };
+    });
+  }
+
+  function readStore(db, storeName) {
+    return new Promise(function (resolve, reject) {
+      if (!db.objectStoreNames || !db.objectStoreNames.contains(storeName)) {
+        resolve([]);
+        return;
+      }
+
+      var transaction = db.transaction(storeName, 'readonly');
+      var store = transaction.objectStore(storeName);
+      var request = store.getAll();
+
+      request.onsuccess = function () {
+        resolve(toArray(request.result));
+      };
+      request.onerror = function () {
+        reject(request.error || new Error('Failed to read store'));
+      };
+    });
+  }
+
+  async function collectIndexedDbGroups() {
+    if (!window.indexedDB || typeof indexedDB.databases !== 'function') return [];
+
+    var databases = [];
+    try {
+      databases = await withTimeout(indexedDB.databases(), 1500, []);
+    } catch (_) {
+      return [];
+    }
+
+    var allGroups = [];
+    for (var i = 0; i < databases.length; i++) {
+      var dbMeta = databases[i];
+      if (!dbMeta || !dbMeta.name) continue;
+
+      var db = null;
+      try {
+        db = await withTimeout(openIndexedDb(dbMeta.name, dbMeta.version), 1000, null);
+        if (!db) continue;
+        var groups = await withTimeout(readStore(db, 'group'), 1000, []);
+        allGroups = allGroups.concat(groups);
+      } catch (_) {
+        // Ignore unrelated databases.
+      } finally {
+        if (db) {
+          try { db.close(); } catch (_) {}
+        }
+      }
+    }
+
+    return dedupeBy(
+      allGroups.map(normalizeGroup).filter(Boolean),
+      function (group) { return group.userId || group.globalId || group.displayName; }
+    );
+  }
+
+  function isGroupConversation(conversation) {
+    if (!conversation) return false;
+
+    if (conversation.isGroup === true || conversation.isGroupChat === true) return true;
+    if (typeof conversation.type === 'string' && conversation.type.toLowerCase().indexOf('group') !== -1) return true;
+    if (typeof conversation.subType === 'string' && conversation.subType.toLowerCase().indexOf('group') !== -1) return true;
+    if (conversation.groupName || conversation.group_name) return true;
+
+    var memberIds = conversation.memberIds || conversation.member_ids || conversation.members || conversation.participantIds;
+    return Array.isArray(memberIds) && memberIds.length > 2;
+  }
+
+  async function collectConversationGroups(zs) {
+    if (!zs || typeof zs.getConversations !== 'function') return [];
+
+    var conversations = [];
+    try {
+      conversations = await withTimeout(zs.getConversations(), 1500, []);
+    } catch (_) {
+      return [];
+    }
+
+    return dedupeBy(
+      toArray(conversations)
+        .filter(isGroupConversation)
+        .map(normalizeGroup)
+        .filter(Boolean),
+      function (group) { return group.userId || group.globalId || group.displayName; }
+    );
+  }
+
+  async function collectGroups(zs) {
+    var directGroups = [];
+    try {
+      directGroups = toArray(await withTimeout(zs.getGroups(), 1500, []));
+    } catch (_) {}
+
+    var indexedDbGroups = [];
+    if (!directGroups.length) {
+      indexedDbGroups = await collectIndexedDbGroups();
+    }
+
+    var conversationGroups = [];
+    if (!directGroups.length && !indexedDbGroups.length) {
+      conversationGroups = await collectConversationGroups(zs);
+    }
+
+    return dedupeBy(
+      directGroups
+        .map(normalizeGroup)
+        .filter(Boolean)
+        .concat(indexedDbGroups)
+        .concat(conversationGroups),
+      function (group) { return group.userId || group.globalId || group.displayName; }
+    );
+  }
+
+  async function collectSnapshot(zs) {
+    var me = null;
+    try { me = await withTimeout(zs.getMe(), 1500, null); } catch (_) {}
+
+    var friends = [];
+    try {
+      friends = dedupeBy(
+        toArray(await withTimeout(zs.getFriends(), 1500, []))
+          .map(normalizeFriend)
+          .filter(Boolean),
+        function (friend) { return friend.userId || friend.globalId || friend.username; }
+      );
+    } catch (_) {}
+
+    var groups = await collectGroups(zs);
+    return { me: me, friends: friends, groups: groups };
+  }
+
+  async function extractAll() {
+    var zs = window.$$afmc && window.$$afmc.zStorage;
+    if (!zs) return false;
+
+    console.log('[ZaloMain] $$afmc.zStorage ready — extracting data');
+
+    try {
+      var best = { me: null, friends: [], groups: [] };
+
+      for (var round = 1; round <= EXTRACTION_RETRIES; round++) {
+        var snapshot = await collectSnapshot(zs);
+        if (!best.me && snapshot.me) best.me = snapshot.me;
+        if (snapshot.friends.length >= best.friends.length) best.friends = snapshot.friends;
+        if (snapshot.groups.length >= best.groups.length) best.groups = snapshot.groups;
+
+        console.log(
+          '[ZaloMain] Extraction attempt',
+          round,
+          'friends:', best.friends.length,
+          'groups:', best.groups.length
+        );
+
+        if (round >= 3 && (best.groups.length > 0 || best.friends.length > 0)) {
+          break;
+        }
+
+        if (round < EXTRACTION_RETRIES) {
+          await delay(EXTRACTION_RETRY_DELAY);
+        }
+      }
+
+      if (best.me) dispatch('me', best.me);
+      if (best.friends.length) {
+        dispatch('friends', best.friends);
+        console.log('[ZaloMain] Extracted', best.friends.length, 'friends');
+      }
+      if (best.groups.length) {
+        dispatch('groups', best.groups);
+        console.log('[ZaloMain] Extracted', best.groups.length, 'groups');
+      }
+
+      dispatch('done', {
+        friends: best.friends.length,
+        groups: best.groups.length,
+      });
+
+      // Now safe to init webpack API bridge (extraction done)
+      _extractionDone = true;
+      setTimeout(tryInitApi, 500);
+
+      return true;
+    } catch (e) {
+      console.error('[ZaloMain] Extraction error:', e);
+      _extractionDone = true;
+      setTimeout(tryInitApi, 500);
+      return false;
+    }
+  }
+
+  // ============================================================
+  // === Webpack API Bridge ===
+  // ============================================================
+
+  function initWebpackApi() {
+    if (_apiReady) return true;
+
+    // Fix broken XHR interceptor from previous trace scripts
+    if (!window.__apiTrace) window.__apiTrace = [];
+
+    // Get __webpack_require__ via webpackJsonp.push trick
+    if (!_wr) {
+      try {
+        window.webpackJsonp.push([['__zalotool_wr__'], {
+          '__zalotool_wr__': function (module, exports, require) { _wr = require; }
+        }, [['__zalotool_wr__']]]);
+        // Clean up to avoid interfering with Zalo's webpack runtime
+        try { window.webpackJsonp.pop(); } catch (_) {}
+      } catch (e) {
+        console.warn('[ZaloMain] webpackJsonp not available yet:', e.message);
+        return false;
+      }
+    }
+
+    if (!_wr) return false;
+
+    // Load transport + business modules from Zalo's webpack runtime.
+    try {
+      var fBUP = _wr('fBUP');
+      _httpModule = fBUP && fBUP.default;
+    } catch (e) {
+      console.warn('[ZaloMain] Failed to load fBUP:', e.message);
+    }
+
+    try {
+      var dThN = _wr('dThN');
+      _businessModule = dThN && dThN.default;
+    } catch (e) {
+      console.warn('[ZaloMain] Failed to load dThN:', e.message);
+    }
+
+    _apiReady = !!(_businessModule || _httpModule);
+    return _apiReady;
+  }
+
+  function getSendTextFunction() {
+    var candidates = [
+      _businessModule,
+      _httpModule,
+    ].filter(Boolean);
+
+    for (var moduleIndex = 0; moduleIndex < candidates.length; moduleIndex += 1) {
+      var module = candidates[moduleIndex];
+      var direct = module && module.sendZText;
+      if (typeof direct === 'function') {
+        return {
+          fn: direct.bind(module),
+          source: module === _businessModule ? 'business' : 'transport',
+        };
+      }
+
+      var alternativeNames = ['sendText', 'sendTextMessage', 'sendMessageText'];
+      for (var nameIndex = 0; nameIndex < alternativeNames.length; nameIndex += 1) {
+        var candidateName = alternativeNames[nameIndex];
+        if (typeof module[candidateName] === 'function') {
+          return {
+            fn: module[candidateName].bind(module),
+            source: module === _businessModule ? 'business' : 'transport',
+          };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function generateClientId() {
+    return Date.now().toString(36) + Math.random().toString(36).substr(2, 8);
+  }
+
+  function firstNonEmpty(values) {
+    for (var i = 0; i < values.length; i += 1) {
+      var value = values[i];
+      if (value == null) continue;
+      var text = String(value).trim();
+      if (text) return text;
+    }
+    return '';
+  }
+
+  function normalizeTimestamp(value) {
+    if (value == null || value === '') return 0;
+    var num = Number(value);
+    if (!isFinite(num) || num <= 0) return 0;
+    if (num < 1000000000000) {
+      return Math.round(num * 1000);
+    }
+    return Math.round(num);
+  }
+
+  function normalizeConversationId(value, isGroup) {
+    var text = String(value || '').trim();
+    if (!text) return '';
+    if (isGroup && (text.charAt(0) === 'g' || text.charAt(0) === 'G')) {
+      return text.slice(1);
+    }
+    return text;
+  }
+
+  function safeJsonParse(value) {
+    if (typeof value !== 'string') return null;
+    try {
+      return JSON.parse(value);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function visitCandidateValue(value, path, target, depth) {
+    if (depth > 3 || value == null) return;
+
+    if (typeof value === 'string') {
+      var lowerPath = String(path || '').toLowerCase();
+      if (!target.decryptKey && (lowerPath.indexOf('zpw_enk') !== -1 || lowerPath.indexOf('decrypt') !== -1 || lowerPath.indexOf('enk') !== -1)) {
+        target.decryptKey = value;
+        target.sessionSource.push(path);
+      }
+      if (!target.labelVersion && lowerPath.indexOf('label') !== -1 && lowerPath.indexOf('version') !== -1) {
+        target.labelVersion = value;
+        target.sessionSource.push(path);
+      }
+
+      var parsed = safeJsonParse(value);
+      if (parsed && typeof parsed === 'object') {
+        visitCandidateValue(parsed, path + '.json', target, depth + 1);
+      }
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (var i = 0; i < Math.min(value.length, 10); i += 1) {
+        visitCandidateValue(value[i], path + '[' + i + ']', target, depth + 1);
+      }
+      return;
+    }
+
+    if (typeof value === 'object') {
+      var keys = Object.keys(value).slice(0, 30);
+      for (var keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
+        var key = keys[keyIndex];
+        var nextPath = path ? path + '.' + key : key;
+        if (!target.commonData && key.toLowerCase() === 'commondata') {
+          target.commonData = value[key];
+          target.sessionSource.push(nextPath);
+        }
+        visitCandidateValue(value[key], nextPath, target, depth + 1);
+      }
+    }
+  }
+
+  function extractSessionHints() {
+    var target = {
+      decryptKey: '',
+      labelVersion: null,
+      commonData: null,
+      sessionSource: [],
+    };
+
+    [window.localStorage, window.sessionStorage].forEach(function (storage, storageIndex) {
+      if (!storage) return;
+      for (var i = 0; i < storage.length; i += 1) {
+        var key = storage.key(i);
+        if (!key) continue;
+        var value = null;
+        try { value = storage.getItem(key); } catch (_) { value = null; }
+        visitCandidateValue(value, (storageIndex === 0 ? 'localStorage.' : 'sessionStorage.') + key, target, 0);
+      }
+    });
+
+    return target;
+  }
+
+  function buildSessionSnapshot() {
+    var imei = '';
+    try {
+      var X4fA = _wr('X4fA');
+      if (X4fA && X4fA.a && typeof X4fA.a.getZaloClientID === 'function') {
+        imei = X4fA.a.getZaloClientID();
+      }
+    } catch (_) {}
+
+    var userId = '';
+    var UIN = '';
+    var commonParams = '';
+    try {
+      var sessionSource = _businessModule || _httpModule;
+      userId = sessionSource && (sessionSource.userId || sessionSource.uid || '');
+      UIN = sessionSource && (sessionSource.UIN || '');
+      commonParams = sessionSource && typeof sessionSource._getCommonParams === 'function'
+        ? sessionSource._getCommonParams()
+        : '';
+    } catch (_) {}
+
+    var hints = extractSessionHints();
+    return {
+      imei: imei,
+      userId: userId,
+      UIN: UIN,
+      commonParams: commonParams,
+      decryptKey: hints.decryptKey || '',
+      labelVersion: hints.labelVersion || null,
+      commonData: hints.commonData || {
+        userId: userId,
+        UIN: UIN,
+        commonParams: commonParams,
+      },
+      sessionSource: hints.sessionSource,
+    };
+  }
+
+  function getConversationIdentifier(conversation) {
+    if (!conversation) return '';
+
+    var isGroup = isGroupConversation(conversation);
+    return normalizeConversationId(
+      firstNonEmpty([
+        conversation.userId,
+        conversation.id,
+        conversation.globalId,
+        conversation.convId,
+        conversation.conv_id,
+        conversation.groupId,
+        conversation.threadId,
+      ]),
+      isGroup
+    );
+  }
+
+  function getConversationDisplayName(conversation) {
+    if (!conversation) return '';
+
+    return firstNonEmpty([
+      conversation.displayName,
+      conversation.name,
+      conversation.title,
+      conversation.groupName,
+      conversation.group_name,
+      conversation.fullName,
+      conversation.zaloName,
+      conversation.username,
+      conversation.userName,
+      conversation.alias,
+    ]);
+  }
+
+  function getConversationAvatar(conversation) {
+    if (!conversation) return '';
+
+    return firstNonEmpty([
+      conversation.avatar,
+      conversation.avatarUrl,
+      conversation.thumb,
+      conversation.thumbSrc,
+      conversation.profileUrl,
+      conversation.icon,
+      conversation.photoUrl,
+    ]);
+  }
+
+  function toReadableText(value) {
+    if (value == null) return '';
+    if (typeof value === 'string') return value.trim();
+    if (typeof value === 'number') return String(value);
+    return '';
+  }
+
+  function extractContentFromNode(node, depth) {
+    if (depth > 4 || node == null) return '';
+
+    if (typeof node === 'string' || typeof node === 'number') {
+      return toReadableText(node);
+    }
+
+    if (Array.isArray(node)) {
+      for (var itemIndex = 0; itemIndex < node.length; itemIndex += 1) {
+        var itemText = extractContentFromNode(node[itemIndex], depth + 1);
+        if (itemText) return itemText;
+      }
+      return '';
+    }
+
+    if (typeof node !== 'object') return '';
+
+    var directCandidates = [
+      node.text,
+      node.content,
+      node.description,
+      node.title,
+      node.caption,
+      node.body,
+      node.msg,
+      node.message,
+      node.href,
+      node.url,
+      node.link,
+    ];
+
+    for (var candidateIndex = 0; candidateIndex < directCandidates.length; candidateIndex += 1) {
+      var directText = toReadableText(directCandidates[candidateIndex]);
+      if (directText) {
+        if (candidateIndex >= 8) {
+          return '[Liên kết] ' + directText;
+        }
+        return directText;
+      }
+    }
+
+    if (node.fileName || node.file_name) {
+      return '[File] ' + (node.fileName || node.file_name);
+    }
+
+    var type = String(node.type || node.msgType || node.mediaType || node.attachmentType || '').toLowerCase();
+    if (node.thumb || node.thumbSrc || node.hdUrl || node.normalUrl || node.imageUrl || node.photoUrl || node.thumbnail || node.image) {
+      return '[Hình ảnh]';
+    }
+    if (node.videoUrl || node.video || type.indexOf('video') !== -1) {
+      return '[Video]';
+    }
+    if (node.audioUrl || node.voiceUrl || node.audio || type.indexOf('audio') !== -1 || type.indexOf('voice') !== -1) {
+      return '[Âm thanh]';
+    }
+    if (node.stickerId || type.indexOf('sticker') !== -1) {
+      return '[Sticker]';
+    }
+
+    var nestedCandidates = [
+      node.data,
+      node.params,
+      node.meta,
+      node.attach,
+      node.attachment,
+      node.attachments,
+      node.payload,
+      node.extra,
+      node.quote,
+    ];
+
+    for (var nestedIndex = 0; nestedIndex < nestedCandidates.length; nestedIndex += 1) {
+      var nestedText = extractContentFromNode(nestedCandidates[nestedIndex], depth + 1);
+      if (nestedText) return nestedText;
+    }
+
+    return '';
+  }
+
+  function extractMessageContent(message) {
+    if (!message || typeof message !== 'object') return '';
+
+    var fields = [
+      message.content,
+      message.msg,
+      message.message,
+      message.text,
+      message.body,
+      message.preview,
+      message.snippet,
+      message.lastMsg,
+      message.lastMessage,
+      message.last_message,
+      message.lastMessageText,
+      message.lastMsgObj,
+      message.last_msg_obj,
+      message.lastMessageObj,
+      message.quote,
+      message.data,
+      message.params,
+    ];
+
+    for (var fieldIndex = 0; fieldIndex < fields.length; fieldIndex += 1) {
+      var content = extractContentFromNode(fields[fieldIndex], 0);
+      if (content) return content;
+    }
+
+    return '';
+  }
+
+  function getConversationLastMessage(conversation) {
+    if (!conversation) return '';
+
+    var rawMessage = firstNonEmpty([
+      conversation.lastMsg,
+      conversation.lastMessage,
+      conversation.last_message,
+      conversation.lastMessageText,
+      conversation.snippet,
+      conversation.preview,
+    ]);
+
+    if (rawMessage) return rawMessage;
+
+    var messageObject = conversation.lastMsgObj || conversation.last_msg_obj || conversation.lastMessageObj || null;
+    return extractMessageContent(messageObject || conversation);
+  }
+
+  function normalizeConversationItem(conversation) {
+    if (!conversation) return null;
+
+    var isGroup = isGroupConversation(conversation);
+    var id = getConversationIdentifier(conversation);
+    var displayName = getConversationDisplayName(conversation);
+
+    if (!id && !displayName) return null;
+
+    var unreadCount = Number(
+      conversation.unreadCount ||
+      conversation.unread ||
+      conversation.totalUnread ||
+      conversation.badge ||
+      0
+    ) || 0;
+
+    var memberIds = conversation.memberIds || conversation.member_ids || conversation.members || conversation.participantIds || [];
+
+    return {
+      id: id,
+      rawId: firstNonEmpty([
+        conversation.userId,
+        conversation.id,
+        conversation.globalId,
+        conversation.convId,
+        conversation.conv_id,
+        conversation.groupId,
+        conversation.threadId,
+      ]),
+      userId: normalizeConversationId(conversation.userId, isGroup),
+      groupId: normalizeConversationId(conversation.groupId || conversation.convId || conversation.conv_id, true),
+      globalId: firstNonEmpty([conversation.globalId]),
+      displayName: displayName,
+      avatar: getConversationAvatar(conversation),
+      isGroup: isGroup,
+      lastMessage: getConversationLastMessage(conversation),
+      lastMsgTime: normalizeTimestamp(
+        conversation.lastMsgTime ||
+        conversation.actionTime ||
+        conversation.lastActionTime ||
+        conversation.last_time ||
+        conversation.updateTime
+      ),
+      unreadCount: unreadCount,
+      isPinned: Boolean(conversation.isPinned || conversation.pinned || conversation.isPin),
+      isMuted: Boolean(conversation.isMuted || conversation.muted || conversation.mute),
+      memberCount: Array.isArray(memberIds)
+        ? memberIds.length
+        : Number(conversation.totalMember || conversation.memberCount || 0) || 0,
+      type: conversation.type || '',
+      subType: conversation.subType || conversation.groupType || '',
+      lastMessageType: firstNonEmpty([
+        conversation.lastMsgType,
+        conversation.lastMessageType,
+        conversation.msgType,
+      ]),
+    };
+  }
+
+  async function getConversationList() {
+    var zs = window.$$afmc && window.$$afmc.zStorage;
+    if (!zs || typeof zs.getConversations !== 'function') {
+      return [];
+    }
+
+    try {
+      var conversations = await withTimeout(zs.getConversations(), 2000, []);
+      return toArray(conversations)
+        .map(normalizeConversationItem)
+        .filter(Boolean)
+        .sort(function (left, right) {
+          return Number(right.lastMsgTime || 0) - Number(left.lastMsgTime || 0);
+        });
+    } catch (_) {
+      return [];
+    }
+  }
+
+  async function getMessageHistory(threadId, isGroup, count) {
+    if (!initWebpackApi()) {
+      console.warn('[ZaloMain] getMessageHistory: webpack API not ready');
+      return [];
+    }
+
+    count = Number(count) || 20;
+
+    try {
+      // For group chats: fBUP.getHistoryMessage(groupId, count) → GET /api/group/history
+      if (isGroup) {
+        var groupModule = _httpModule || _businessModule;
+        if (groupModule && typeof groupModule.getHistoryMessage === 'function') {
+          console.log('[ZaloMain] getMessageHistory: calling getHistoryMessage for group', threadId);
+          var result = await withTimeout(groupModule.getHistoryMessage(threadId, count), 10000, null);
+          if (result) {
+            console.log('[ZaloMain] group history raw keys:', Object.keys(result));
+            var msgs = extractMessages(result);
+            var arr = msgs.map(normalizeMessage).filter(Boolean);
+            console.log('[ZaloMain] getMessageHistory: group result =', arr.length, 'messages');
+            return arr;
+          }
+        }
+        console.warn('[ZaloMain] getMessageHistory: getHistoryMessage not available for groups');
+        return [];
+      }
+
+      // For 1:1 chats: fBUP.getCM(threadId, globalMsgId, ?, count) → GET /api/cm/getrecentv2
+      var httpMod = _httpModule;
+      if (!httpMod) httpMod = _businessModule;
+
+      // Primary: getCM (Cloud Messages) - the correct API for 1:1 message history
+      // getCM(conversationId, globalMsgId=0, unknownParam=0, count, reqId?, timeout?, opts?)
+      if (httpMod && typeof httpMod.getCM === 'function') {
+        console.log('[ZaloMain] getMessageHistory: calling getCM for 1:1 chat', threadId);
+        var cmResult = await withTimeout(httpMod.getCM(threadId, 0, 0, count), 10000, null);
+        if (cmResult) {
+          // Log raw structure to understand response format
+          console.log('[ZaloMain] getCM raw keys:', Object.keys(cmResult));
+          if (cmResult.msgs) console.log('[ZaloMain] getCM msgs count:', cmResult.msgs.length, 'sample:', cmResult.msgs[0] ? Object.keys(cmResult.msgs[0]) : 'empty');
+          if (cmResult.data) console.log('[ZaloMain] getCM data:', typeof cmResult.data, Array.isArray(cmResult.data) ? cmResult.data.length : '');
+          
+          var cmMsgs = extractMessages(cmResult);
+          var cmArr = cmMsgs.map(normalizeMessage).filter(Boolean);
+          console.log('[ZaloMain] getMessageHistory: getCM result =', cmArr.length, 'messages');
+          if (cmArr.length > 0) return cmArr;
+        }
+      }
+
+      // Fallback: try getHistoryMessage for 1:1 as well (some Zalo versions)
+      if (httpMod && typeof httpMod.getHistoryMessage === 'function') {
+        console.log('[ZaloMain] getMessageHistory: trying getHistoryMessage fallback for 1:1', threadId);
+        var histResult = await withTimeout(httpMod.getHistoryMessage(threadId, count), 10000, null);
+        if (histResult) {
+          var histMsgs = extractMessages(histResult);
+          var histArr = histMsgs.map(normalizeMessage).filter(Boolean);
+          if (histArr.length > 0) {
+            console.log('[ZaloMain] getMessageHistory: getHistoryMessage fallback =', histArr.length, 'messages');
+            return histArr;
+          }
+        }
+      }
+
+      // Log available methods for debugging (only first time)
+      if (httpMod && !getMessageHistory._loggedMethods) {
+        getMessageHistory._loggedMethods = true;
+        var allMethods = Object.keys(httpMod).filter(function (k) {
+          return typeof httpMod[k] === 'function';
+        }).sort();
+        console.log('[ZaloMain] All httpModule methods:', allMethods.join(', '));
+      }
+
+      return [];
+    } catch (err) {
+      console.error('[ZaloMain] getMessageHistory error:', err.message || err);
+      return [];
+    }
+  }
+
+  // Extract message array from various Zalo API response shapes
+  function extractMessages(result) {
+    if (!result) return [];
+    // Most Zalo APIs return { msgs: [...] } or { groupMsgs: [...] }
+    if (Array.isArray(result.msgs)) return result.msgs;
+    if (Array.isArray(result.groupMsgs)) return result.groupMsgs;
+    if (Array.isArray(result.data)) return result.data;
+    if (Array.isArray(result.messages)) return result.messages;
+    // If result itself is an array
+    if (Array.isArray(result)) return result;
+    // If result is a Map or object with numeric-ish keys
+    return toArray(result);
+  }
+
+  function normalizeMessage(msg) {
+    if (!msg || typeof msg !== 'object') return null;
+
+    var content = extractMessageContent(msg) || '[Tin nhắn không có nội dung]';
+
+    // Zalo uses "0" to mean "self" for both uidFrom and idTo
+    var fromId = String(msg.uidFrom || msg.fromUid || msg.fromId || msg.senderId || msg.uid || '');
+    var toId = String(msg.idTo || msg.toId || msg.toUid || '');
+    
+    // Generate unique message ID from available fields
+    var msgId = String(msg.msgId || msg.globalMsgId || msg.actionId || msg.realMsgId || msg.cliMsgId || msg.id || '');
+    
+    // If still no msgId, generate one from content hash
+    if (!msgId) {
+      msgId = 'gen_' + (msg.ts || Date.now()) + '_' + (fromId || 'x') + '_' + Math.random().toString(36).substr(2, 6);
+    }
+
+    var ts = Number(msg.ts || msg.sendDttm || msg.createTime || msg.time || 0);
+    // Zalo sometimes returns ts as a string
+    if (typeof msg.ts === 'string' && msg.ts.length > 0) {
+      ts = Number(msg.ts);
+    }
+
+    return {
+      msgId: msgId,
+      fromId: fromId,
+      toId: toId,
+      content: content,
+      ts: ts,
+      msgType: msg.msgType || msg.type || 'text',
+      status: msg.status || 0,
+      cliMsgId: String(msg.cliMsgId || ''),
+      dName: msg.dName || '',
+      quote: msg.quote || null,
+    };
+  }
+
+  async function getConversationPreview(toId) {
+    var zs = window.$$afmc && window.$$afmc.zStorage;
+    if (!zs || typeof zs.getConversations !== 'function' || !toId) {
+      return null;
+    }
+
+    var normalizedToId = normalizeConversationId(toId, true);
+
+    try {
+      var conversations = await withTimeout(zs.getConversations(), 1500, []);
+      var items = toArray(conversations);
+      var match = items.find(function (conversation) {
+        if (!conversation) return false;
+        var conversationIds = [
+          conversation.userId,
+          conversation.id,
+          conversation.globalId,
+          conversation.convId,
+          conversation.groupId,
+        ].map(function (value) {
+          return normalizeConversationId(value, true);
+        });
+
+        return conversationIds.indexOf(normalizedToId) !== -1;
+      });
+
+      if (!match) return null;
+      return {
+        id: match.userId || match.id || match.globalId || '',
+        lastMsg: getConversationLastMessage(match),
+        lastMsgTime: match.lastMsgTime || match.actionTime || match.lastActionTime || 0,
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function executeApiCall(method, args) {
+    if (!initWebpackApi()) {
+      return Promise.reject(new Error('Webpack API chưa sẵn sàng. Trang Zalo có thể chưa tải xong.'));
+    }
+
+    switch (method) {
+      case 'sendZText': {
+        var isGroup = !!args.isGroup;
+        var toId = normalizeConversationId(args.toId, isGroup);
+        var message = args.message;
+        var clientId = args.clientId || generateClientId();
+        var sendText = getSendTextFunction();
+        if (!sendText) {
+          return Promise.reject(new Error('Không tìm thấy hàm gửi text của Zalo runtime.'));
+        }
+        console.log('[ZaloMain] Sending text via', sendText.source, 'module');
+        return sendText.fn(toId, message, isGroup, clientId, 0, null, null);
+      }
+
+      case 'sendSticker': {
+        return _httpModule.sendSticker(
+          args.toId, args.stickerId, args.cateId, args.type || 0,
+          !!args.isGroup, args.clientId || generateClientId(), 0, null, null
+        );
+      }
+
+      case 'sendFriendRequest': {
+        var dThN = null;
+        try { dThN = _wr('dThN'); } catch (e) {}
+        if (dThN && dThN.default && typeof dThN.default.sendFriendRequest === 'function') {
+          return dThN.default.sendFriendRequest(args.userId, args.message || '');
+        }
+        // Fallback: use fBUP if available
+        if (typeof _httpModule.sendFriendRequest === 'function') {
+          return _httpModule.sendFriendRequest(args.userId, args.message || '');
+        }
+        return Promise.reject(new Error('sendFriendRequest không khả dụng.'));
+      }
+
+      case 'keepAlive': {
+        var keepAliveOwner = _businessModule || _httpModule;
+        if (!keepAliveOwner || typeof keepAliveOwner.keepAlive !== 'function') {
+          return Promise.reject(new Error('keepAlive không khả dụng.'));
+        }
+        return keepAliveOwner.keepAlive();
+      }
+
+      case 'checkApiReady': {
+        return Promise.resolve({
+          ready: _apiReady,
+          hasHttpModule: !!_httpModule,
+          hasBusinessModule: !!_businessModule,
+          sendStrategy: getSendTextFunction() ? getSendTextFunction().source : null,
+        });
+      }
+
+      case 'getSessionSnapshot': {
+        return Promise.resolve(buildSessionSnapshot());
+      }
+
+      case 'getConversationPreview': {
+        return getConversationPreview(args.toId);
+      }
+
+      case 'getConversationList': {
+        return getConversationList();
+      }
+
+      case 'getMessageHistory': {
+        return getMessageHistory(args.threadId, !!args.isGroup, args.count || 20);
+      }
+
+      case 'debugModuleMethods': {
+        var debugInfo = { httpModule: [], businessModule: [], zStorage: [] };
+        if (_httpModule) {
+          debugInfo.httpModule = Object.keys(_httpModule).filter(function (k) {
+            return typeof _httpModule[k] === 'function';
+          }).sort();
+        }
+        if (_businessModule) {
+          debugInfo.businessModule = Object.keys(_businessModule).filter(function (k) {
+            return typeof _businessModule[k] === 'function';
+          }).sort();
+        }
+        var zs = window.$$afmc && window.$$afmc.zStorage;
+        if (zs) {
+          debugInfo.zStorage = Object.keys(zs).filter(function (k) {
+            return typeof zs[k] === 'function';
+          }).sort();
+        }
+        return Promise.resolve(debugInfo);
+      }
+
+      default:
+        return Promise.reject(new Error('Phương thức API không xác định: ' + method));
+    }
+  }
+
+  // Listen for API calls from ISOLATED world (zalo-bridge.js)
+  // Uses window.postMessage because CustomEvent.detail does NOT cross
+  // from ISOLATED → MAIN world in Chrome extensions.
+  window.addEventListener('message', function (e) {
+    if (!e.data || e.data.source !== '__zalotool_api__') return;
+
+    // Handle init request
+    if (e.data.action === 'init') {
+      tryInitApi();
+      return;
+    }
+
+    var callId = e.data.callId;
+    if (!callId) return;
+
+    executeApiCall(e.data.method, e.data.args || {})
+      .then(function (data) {
+        window.dispatchEvent(new CustomEvent('__zalotool_api_result__', {
+          detail: JSON.stringify({ callId: callId, ok: true, data: data }),
+        }));
+      })
+      .catch(function (err) {
+        window.dispatchEvent(new CustomEvent('__zalotool_api_result__', {
+          detail: JSON.stringify({ callId: callId, ok: false, error: err.message || String(err) }),
+        }));
+      });
+  });
+
+  // Initialize API bridge AFTER extraction completes (to avoid
+  // interfering with Zalo's webpack runtime during page load).
+  var _extractionDone = false;
+
+  function tryInitApi() {
+    if (_apiReady) return;
+    if (!window.webpackJsonp) return;
+    if (initWebpackApi()) {
+      console.log('[ZaloMain] Webpack API bridge ready');
+      dispatch('session', buildSessionSnapshot());
+      dispatch('api_ready', { available: true });
+    }
+  }
+
+  // ============================================================
+
+  // Listen for manual re-extract requests
+  window.addEventListener('__zalotool_extract__', function () {
+    extractAll();
+  });
+
+  // Poll until zStorage is ready
+  var timer = setInterval(function () {
+    attempt++;
+    if (attempt > MAX_WAIT) {
+      clearInterval(timer);
+      console.log('[ZaloMain] Gave up waiting for $$afmc.zStorage');
+      return;
+    }
+    if (window.$$afmc && window.$$afmc.zStorage) {
+      clearInterval(timer);
+      // Small delay for zStorage to finish initialising.
+      setTimeout(function () { extractAll(); }, INITIAL_EXTRACT_DELAY);
+    }
+  }, 1000);
+
+  console.log('[ZaloMain] Waiting for $$afmc.zStorage…');
+})();

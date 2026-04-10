@@ -1,0 +1,50 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Dependencies
+node_modules
+**/node_modules
+
+# Build output
+dist
+
+# Environment / secrets
+*.local
+*.env
+!backend/.env.example
+
+# Data & runtime artifacts
+artifacts
+profiles
+service/data/
+backend/data/
+
+# Secrets
+client_secret_*.json
+
+# Third-party reference copies
+reference/extension-modified
+reference/zalotool.net_4.0.7
+
+# zalo-api-final dev files
+reference/zalo-api-final/.github
+reference/zalo-api-final/.husky
+reference/zalo-api-final/docs
+reference/zalo-api-final/test
+reference/zalo-api-final/src
+reference/zalo-api-final/qr.png
+reference/zalo-api-final/bun.lock
+reference/zalo-api-final/*.sh
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

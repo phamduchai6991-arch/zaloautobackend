@@ -1,0 +1,16 @@
+{
+  "name": "autozalo-backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n backend,zalo -c yellow,green \"node backend/server.js\" \"node service/server.js\"",
+    "dev:backend": "node backend/server.js",
+    "dev:zalo": "node service/server.js",
+    "start": "node backend/server.js",
+    "pack:ext": "node tools/zip-extension.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

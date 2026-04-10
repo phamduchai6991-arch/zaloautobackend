@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "AutoZalo Bridge",
+  "version": "1.0.0",
+  "description": "AutoZalo.vn — Quản lý Zalo đa tài khoản",
+  "incognito": "spanning",
+  "permissions": [
+    "cookies",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*.zalo.me/*",
+    "https://autozalo.vn/*",
+    "https://*.autozalo.vn/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "https://localhost/*",
+    "https://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chat.zalo.me/*"],
+      "js": ["content/zalo-main.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://chat.zalo.me/*"],
+      "js": ["content/zalo-bridge.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "exclude_matches": [
+        "https://chat.zalo.me/*"
+      ],
+      "js": ["content/web-bridge.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
