@@ -21,6 +21,13 @@ import {
 } from './lib/adminHandlers.js';
 import { handleSyncUser } from './lib/userHandlers.js';
 import {
+  getAccountsByUser,
+  registerAccount,
+  removeAccount,
+  touchAccount,
+  PLAN_LIMITS,
+} from './lib/accountStore.js';
+import {
   handleAccountSync,
   handleSendBatch,
   handleFriendRequestBatch,
@@ -389,7 +396,8 @@ const server = createServer(async (req, res) => {
   }
 
   try {
-    const url = req.url?.split('?')[0] || '/';
+    const fullUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const url = fullUrl.pathname;
 
     if (req.method === 'POST' && url === '/sepay_webhook.php') {
       const body = await readBody(req);
@@ -454,6 +462,38 @@ const server = createServer(async (req, res) => {
       if (req.method === 'POST' && url === '/api/admin/grant-subscription') {
         const body = await readBody(req);
         return handleAdminGrantSubscription(req, res, body);
+      }
+
+      // ─── Zalo account tracking (server-side limit enforcement) ───
+
+      // GET /api/accounts?userId=xxx — list registered Zalo accounts
+      if (req.method === 'GET' && url === '/api/accounts') {
+        const userId = fullUrl.searchParams.get('userId');
+        if (!userId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId.' });
+        const accounts = await getAccountsByUser(userId);
+        return writeJson(res, 200, { ok: true, accounts });
+      }
+
+      // POST /api/accounts/register — register a Zalo account for a user
+      if (req.method === 'POST' && url === '/api/accounts/register') {
+        const body = await readBody(req);
+        const { userId, zaloId, zaloName, zaloAvatar, zaloPhone } = body || {};
+        if (!userId || !zaloId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId hoặc zaloId.' });
+        // Look up actual subscription server-side — don't trust client planKey
+        const { getSubscription } = await import('./lib/paymentStore.js');
+        const sub = await getSubscription(userId);
+        const planKey = (sub?.status === 'active' ? sub.planKey : null) || 'basic';
+        const result = await registerAccount({ userId, planKey, zaloId, zaloName, zaloAvatar, zaloPhone });
+        return writeJson(res, result.ok ? 200 : 403, result);
+      }
+
+      // POST /api/accounts/remove — remove a Zalo account
+      if (req.method === 'POST' && url === '/api/accounts/remove') {
+        const body = await readBody(req);
+        const { userId, zaloId } = body || {};
+        if (!userId || !zaloId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId hoặc zaloId.' });
+        const removed = await removeAccount(userId, zaloId);
+        return writeJson(res, 200, { ok: true, removed });
       }
 
       // ─── Zalo API proxy routes (uses zalo-api-final) ───
