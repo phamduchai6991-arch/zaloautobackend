@@ -12,6 +12,13 @@ import {
   writeJson,
   readBody,
 } from './lib/paymentHandlers.js';
+import {
+  handleAdminStats,
+  handleAdminUsers,
+  handleAdminOrders,
+  handleAdminLogin,
+} from './lib/adminHandlers.js';
+import { handleSyncUser } from './lib/userHandlers.js';
 
 // Load .env file
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -30,7 +37,7 @@ if (existsSync(envPath)) {
 }
 
 const PORT = Number(process.env.PORT || 3000);
-const DIST_DIR = process.env.DIST_DIR || join(__dirname, 'dist');
+const DIST_DIR = join(__dirname, '..', 'frontend', 'dist');
 
 // ─── CORS ────────────────────────────────────────────────
 
@@ -113,6 +120,11 @@ const server = createServer(async (req, res) => {
   try {
     const url = req.url?.split('?')[0] || '/';
 
+    if (req.method === 'POST' && url === '/sepay_webhook.php') {
+      const body = await readBody(req);
+      return handleSepayWebhook(req, res, body);
+    }
+
     // ─── API routes ────────────────────────────────
 
     if (url.startsWith('/api/')) {
@@ -124,6 +136,11 @@ const server = createServer(async (req, res) => {
       if (req.method === 'POST' && url === '/api/payment/create-order') {
         const body = await readBody(req);
         return handleCreateOrder(req, res, body);
+      }
+
+      if (req.method === 'POST' && url === '/api/users/sync') {
+        const body = await readBody(req);
+        return handleSyncUser(req, res, body);
       }
 
       const orderMatch = url.match(/^\/api\/payment\/orders\/([A-Z0-9]+)$/);
@@ -144,6 +161,23 @@ const server = createServer(async (req, res) => {
       if (req.method === 'POST' && url === '/api/payment/webhook/sepay') {
         const body = await readBody(req);
         return handleSepayWebhook(req, res, body);
+      }
+
+      if (req.method === 'POST' && url === '/api/admin/login') {
+        const body = await readBody(req);
+        return handleAdminLogin(req, res, body);
+      }
+
+      if (req.method === 'GET' && url === '/api/admin/stats') {
+        return handleAdminStats(req, res);
+      }
+
+      if (req.method === 'GET' && url === '/api/admin/users') {
+        return handleAdminUsers(req, res);
+      }
+
+      if (req.method === 'GET' && url === '/api/admin/orders') {
+        return handleAdminOrders(req, res);
       }
 
       return writeJson(res, 404, { ok: false, error: 'API endpoint không tồn tại.' });

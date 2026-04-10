@@ -38,12 +38,18 @@ function saveOrders() {
   saveJson(ORDERS_FILE, _orders);
 }
 
+function isExpiredPendingOrder(order, maxAgeMs = 24 * 60 * 60 * 1000) {
+  if (!order || order.status !== 'pending') return false;
+  return Date.now() - new Date(order.createdAt).getTime() > maxAgeMs;
+}
+
 let _orderCounter = 0;
 
 function generateOrderCode() {
-  const now = Date.now().toString(36).toUpperCase().slice(-4);
-  _orderCounter++;
-  return `AZ${now}${_orderCounter.toString().padStart(2, '0')}`;
+  const ts = Date.now().toString(36).toUpperCase().slice(-5);
+  const rand = Math.random().toString(36).toUpperCase().slice(-1);
+  _orderCounter = (_orderCounter + 1) % 100;
+  return `AZ${ts}${rand}${_orderCounter.toString().padStart(2, '0')}`;
 }
 
 export function createOrder({ userId, userEmail, planKey, period, amount }) {
@@ -70,7 +76,17 @@ export function createOrder({ userId, userEmail, planKey, period, amount }) {
 }
 
 export function getOrder(code) {
-  return getOrders()[code] || null;
+  const orders = getOrders();
+  const order = orders[code] || null;
+  if (!order) return null;
+
+  if (isExpiredPendingOrder(order)) {
+    order.status = 'expired';
+    _orders = orders;
+    saveOrders();
+  }
+
+  return order;
 }
 
 export function getOrdersByUser(userId) {
@@ -151,8 +167,19 @@ export function activateSubscription(order) {
 
   if (existing && existing.status === 'active' && new Date(existing.expiresAt) > new Date()) {
     const tierRank = { basic: 1, plus: 2, pro: 3 };
-    if (tierRank[order.planKey] >= tierRank[existing.planKey]) {
+    const newRank = tierRank[order.planKey] ?? 0;
+    const oldRank = tierRank[existing.planKey] ?? 0;
+
+    if (newRank >= oldRank) {
       existing.planKey = order.planKey;
+      const currentEnd = new Date(existing.expiresAt);
+      existing.expiresAt = new Date(currentEnd.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+      existing.updatedAt = new Date().toISOString();
+      existing.lastOrderCode = order.code;
+      _subs = subs;
+      saveSubs();
+      return existing;
+    } else {
       const currentEnd = new Date(existing.expiresAt);
       existing.expiresAt = new Date(currentEnd.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
       existing.updatedAt = new Date().toISOString();
@@ -192,4 +219,12 @@ export function getSubscription(userId) {
   }
 
   return sub;
+}
+
+export function getAllSubscriptions() {
+  return Object.values(getSubs());
+}
+
+export function getAllOrders() {
+  return Object.values(getOrders());
 }
