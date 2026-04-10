@@ -27,6 +27,239 @@ import {
   handleGroupInviteTargets,
   handleActionBatch,
 } from '../service/lib/handlers.js';
+import { createApiClient, getUserAgent } from '../service/lib/apiClient.js';
+import { isGroupJob, normalizeThreadId, getDelayMs, sleep } from '../service/lib/zaloHelpers.js';
+import { ThreadType } from 'zalo-api-final';
+
+// ─── Streaming NDJSON helpers ────────────────────────────
+
+function writeNdjsonLine(res, data) {
+  res.write(JSON.stringify(data) + '\n');
+}
+
+async function handleSendBatchStream(req, res, body) {
+  const account = body?.account;
+  const jobs = Array.isArray(body?.jobs) ? body.jobs : [];
+
+  if (!account) {
+    writeJson(res, 400, { ok: false, error: 'Thiếu account để gửi tin.' });
+    return;
+  }
+  if (!jobs.length) {
+    writeJson(res, 400, { ok: false, error: 'Danh sách jobs rỗng.' });
+    return;
+  }
+
+  const userAgent = getUserAgent(body, req);
+  let api;
+  try {
+    ({ api } = await createApiClient(account, userAgent));
+  } catch (error) {
+    writeJson(res, 500, {
+      ok: false,
+      error: error instanceof Error ? error.message : 'Không thể khởi tạo phiên Zalo.',
+      code: 'SERVICE_LOGIN_FAILED',
+    });
+    return;
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'application/x-ndjson',
+    'Transfer-Encoding': 'chunked',
+    'Cache-Control': 'no-cache',
+  });
+
+  let accepted = 0;
+  let failed = 0;
+
+  for (let index = 0; index < jobs.length; index += 1) {
+    const job = jobs[index];
+    const groupJob = isGroupJob(job);
+    const zid = normalizeThreadId(job?.zid, groupJob);
+    const content = String(job?.content || '').trim();
+    const startedAt = new Date().toISOString();
+
+    // Emit "running" status
+    writeNdjsonLine(res, {
+      jobId: job.id,
+      status: 'running',
+      statusLabel: `Đang gửi ${index + 1}/${jobs.length}`,
+      startedAt,
+      provider: 'server',
+    });
+
+    if (!zid || zid === '—') {
+      failed++;
+      writeNdjsonLine(res, {
+        jobId: job?.id, ok: false, status: 'failed',
+        statusLabel: 'Thiếu Zalo ID',
+        error: 'Job không có Zalo ID hợp lệ.',
+        startedAt, failedAt: new Date().toISOString(), provider: 'server',
+      });
+      continue;
+    }
+
+    if (!content) {
+      failed++;
+      writeNdjsonLine(res, {
+        jobId: job?.id, ok: false, status: 'failed',
+        statusLabel: 'Thiếu nội dung',
+        error: 'Job không có nội dung tin nhắn.',
+        startedAt, failedAt: new Date().toISOString(), provider: 'server',
+      });
+      continue;
+    }
+
+    try {
+      const threadType = groupJob ? ThreadType.Group : ThreadType.User;
+      const apiResult = await api.sendMessage(content, zid, threadType);
+      accepted++;
+      writeNdjsonLine(res, {
+        jobId: job.id, ok: true, status: 'sent',
+        statusLabel: 'Đã gửi',
+        startedAt, sentAt: new Date().toISOString(), provider: 'server',
+        apiResult,
+      });
+    } catch (error) {
+      failed++;
+      writeNdjsonLine(res, {
+        jobId: job?.id, ok: false, status: 'failed',
+        statusLabel: 'Gửi thất bại',
+        error: error instanceof Error ? error.message : 'Gửi tin nhắn thất bại.',
+        startedAt, failedAt: new Date().toISOString(), provider: 'server',
+      });
+    }
+
+    if (index < jobs.length - 1) {
+      const delayMs = getDelayMs(job?.delayWindow);
+      if (delayMs > 0) await sleep(delayMs);
+    }
+  }
+
+  writeNdjsonLine(res, { _done: true, ok: true, accepted, failed });
+  res.end();
+}
+
+async function handleFriendRequestBatchStream(req, res, body) {
+  const account = body?.account;
+  const jobs = Array.isArray(body?.jobs) ? body.jobs : [];
+
+  if (!account) {
+    writeJson(res, 400, { ok: false, error: 'Thiếu account để gửi lời mời kết bạn.' });
+    return;
+  }
+  if (!jobs.length) {
+    writeJson(res, 400, { ok: false, error: 'Danh sách job kết bạn rỗng.' });
+    return;
+  }
+
+  const userAgent = getUserAgent(body, req);
+  let api;
+  try {
+    ({ api } = await createApiClient(account, userAgent));
+  } catch (error) {
+    writeJson(res, 500, {
+      ok: false,
+      error: error instanceof Error ? error.message : 'Không thể khởi tạo phiên Zalo.',
+      code: 'SERVICE_LOGIN_FAILED',
+    });
+    return;
+  }
+
+  // ensureCustomApiActions — inline subset needed for friend requests
+  if (typeof api?.custom === 'function' && typeof api.rejectFriendRequest !== 'function') {
+    api.custom('rejectFriendRequest', async ({ ctx, utils, props }) => {
+      const userId = String(props?.userId || props || '').trim();
+      const serviceURL = utils.makeURL(`${api.zpwServiceMap.friend[0]}/api/friend/reject`);
+      const encryptedParams = utils.encodeAES(JSON.stringify({ fid: userId, language: ctx.language }));
+      if (!encryptedParams) throw new Error('Failed to encrypt params');
+      const response = await utils.request(serviceURL, {
+        method: 'POST',
+        body: new URLSearchParams({ params: encryptedParams }),
+      });
+      return utils.resolve(response);
+    });
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'application/x-ndjson',
+    'Transfer-Encoding': 'chunked',
+    'Cache-Control': 'no-cache',
+  });
+
+  let accepted = 0;
+  let failed = 0;
+
+  for (let index = 0; index < jobs.length; index += 1) {
+    const job = jobs[index];
+    const userId = String(job?.zid || '').trim();
+    const note = String(job?.note || '').trim();
+    const startedAt = new Date().toISOString();
+
+    writeNdjsonLine(res, {
+      jobId: job.id,
+      status: 'running',
+      statusLabel: `Đang kết bạn ${index + 1}/${jobs.length}`,
+      startedAt,
+      provider: 'server',
+    });
+
+    if (!userId || userId === '—') {
+      failed++;
+      writeNdjsonLine(res, {
+        jobId: job?.id, ok: false, status: 'failed',
+        statusLabel: 'Thiếu Zalo ID',
+        error: 'Job không có Zalo ID hợp lệ.',
+        startedAt, failedAt: new Date().toISOString(), provider: 'server',
+      });
+      continue;
+    }
+
+    try {
+      const apiResult = await api.sendFriendRequest(note, userId);
+      accepted++;
+      writeNdjsonLine(res, {
+        jobId: job.id, ok: true, status: 'sent',
+        statusLabel: 'Đã gửi lời mời',
+        startedAt, sentAt: new Date().toISOString(), provider: 'server',
+        apiResult,
+      });
+    } catch (error) {
+      const code = typeof error?.code === 'number' ? error.code : null;
+      if (code === 222) {
+        accepted++;
+        writeNdjsonLine(res, {
+          jobId: job.id, ok: true, status: 'accepted',
+          statusLabel: 'Đã chấp nhận lời mời',
+          startedAt, sentAt: new Date().toISOString(), provider: 'server',
+        });
+      } else if (code === 225) {
+        accepted++;
+        writeNdjsonLine(res, {
+          jobId: job.id, ok: true, status: 'skipped',
+          statusLabel: 'Đã là bạn bè',
+          startedAt, sentAt: new Date().toISOString(), provider: 'server',
+        });
+      } else {
+        failed++;
+        writeNdjsonLine(res, {
+          jobId: job?.id, ok: false, status: 'failed',
+          statusLabel: 'Kết bạn thất bại',
+          error: error instanceof Error ? error.message : 'Gửi lời mời kết bạn thất bại.',
+          startedAt, failedAt: new Date().toISOString(), provider: 'server',
+        });
+      }
+    }
+
+    if (index < jobs.length - 1) {
+      const delayMs = getDelayMs(job?.delayWindow);
+      if (delayMs > 0) await sleep(delayMs);
+    }
+  }
+
+  writeNdjsonLine(res, { _done: true, ok: true, accepted, failed });
+  res.end();
+}
 
 // Load .env file
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -232,12 +465,12 @@ const server = createServer(async (req, res) => {
 
       if (req.method === 'POST' && url === '/api/zalo/messages/batch') {
         const body = await readBody(req);
-        return handleSendBatch(req, res, body);
+        return handleSendBatchStream(req, res, body);
       }
 
       if (req.method === 'POST' && url === '/api/zalo/friends/requests/batch') {
         const body = await readBody(req);
-        return handleFriendRequestBatch(req, res, body);
+        return handleFriendRequestBatchStream(req, res, body);
       }
 
       if (req.method === 'POST' && url === '/api/zalo/groups/invite-targets') {
