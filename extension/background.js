@@ -21,12 +21,56 @@ let syncState = {
   startedAt: null,
 };
 
-const TRUSTED_ORIGIN_PATTERN = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i;
-const TRUSTED_DOMAIN_PATTERN = /^https:\/\/([a-z0-9-]+\.)*autozalo\.vn\//i;
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function compileMatchPattern(pattern) {
+  const match = String(pattern || '').match(/^(\*|https?|http):\/\/([^/]+)(\/.*)$/i);
+  if (!match) return null;
+
+  const schemePart = match[1];
+  const hostPart = match[2];
+  const pathPart = match[3];
+  const scheme = schemePart === '*' ? 'https?' : escapeRegex(schemePart);
+  let host = '';
+
+  if (hostPart === '*') {
+    host = '[^/]+?';
+  } else if (hostPart.indexOf('*.') === 0) {
+    host = '(?:[^./]+\\.)*' + escapeRegex(hostPart.slice(2));
+  } else {
+    host = escapeRegex(hostPart);
+  }
+
+  const port = '(?::\\d+)?';
+  const path = escapeRegex(pathPart).replace(/\\\*/g, '.*');
+  return new RegExp('^' + scheme + ':\\/\\/' + host + port + path + '$', 'i');
+}
+
+function getAllowedWebAppPatterns() {
+  try {
+    const manifest = chrome.runtime.getManifest();
+    const hostPermissions = Array.isArray(manifest && manifest.host_permissions) ? manifest.host_permissions : [];
+    return hostPermissions
+      .filter((pattern) => /^https?:\/\//i.test(pattern) && !/zalo\.me/i.test(pattern))
+      .map((pattern) => compileMatchPattern(pattern))
+      .filter(Boolean);
+  } catch (_) {
+    return [];
+  }
+}
+
+const TRUSTED_WEB_APP_PATTERNS = getAllowedWebAppPatterns();
 
 function isTrustedWebAppUrl(url) {
   if (!url) return false;
-  return TRUSTED_ORIGIN_PATTERN.test(url) || TRUSTED_DOMAIN_PATTERN.test(url);
+  try {
+    const normalizedUrl = new URL(url).href;
+    return TRUSTED_WEB_APP_PATTERNS.some((regex) => regex.test(normalizedUrl));
+  } catch (_) {
+    return false;
+  }
 }
 
 function isTrustedWebAppSender(sender) {

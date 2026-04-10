@@ -13,6 +13,7 @@
     "https://*.zalo.me/*",
     "https://autozalo.vn/*",
     "https://*.autozalo.vn/*",
+    "https://*.onrender.com/*",
     "http://localhost/*",
     "http://127.0.0.1/*",
     "https://localhost/*",
