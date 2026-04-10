@@ -1,4 +1,8 @@
 import pg from 'pg';
+import dns from 'node:dns';
+
+// Render doesn't support IPv6 outbound — force IPv4 for Supabase connection
+dns.setDefaultResultOrder('ipv4first');
 
 let pool = null;
 
@@ -12,6 +16,7 @@ function ensurePool() {
     max: 5,
     idleTimeoutMillis: 30000,
   });
+  pool.on('error', (err) => console.error('[db] pool error:', err.message));
   return pool;
 }
 
