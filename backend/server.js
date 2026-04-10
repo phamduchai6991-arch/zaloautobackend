@@ -20,6 +20,13 @@ import {
   handleAdminGrantSubscription,
 } from './lib/adminHandlers.js';
 import { handleSyncUser } from './lib/userHandlers.js';
+import {
+  handleAccountSync,
+  handleSendBatch,
+  handleFriendRequestBatch,
+  handleGroupInviteTargets,
+  handleActionBatch,
+} from '../service/lib/handlers.js';
 
 // Load .env file
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -214,6 +221,33 @@ const server = createServer(async (req, res) => {
       if (req.method === 'POST' && url === '/api/admin/grant-subscription') {
         const body = await readBody(req);
         return handleAdminGrantSubscription(req, res, body);
+      }
+
+      // ─── Zalo API proxy routes (uses zalo-api-final) ───
+
+      if (req.method === 'POST' && url === '/api/zalo/account/sync') {
+        const body = await readBody(req);
+        return handleAccountSync(req, res, body);
+      }
+
+      if (req.method === 'POST' && url === '/api/zalo/messages/batch') {
+        const body = await readBody(req);
+        return handleSendBatch(req, res, body);
+      }
+
+      if (req.method === 'POST' && url === '/api/zalo/friends/requests/batch') {
+        const body = await readBody(req);
+        return handleFriendRequestBatch(req, res, body);
+      }
+
+      if (req.method === 'POST' && url === '/api/zalo/groups/invite-targets') {
+        const body = await readBody(req);
+        return handleGroupInviteTargets(req, res, body);
+      }
+
+      if (req.method === 'POST' && url === '/api/zalo/actions/batch') {
+        const body = await readBody(req);
+        return handleActionBatch(req, res, body);
       }
 
       return writeJson(res, 404, { ok: false, error: 'API endpoint không tồn tại.' });
