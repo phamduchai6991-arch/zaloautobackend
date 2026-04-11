@@ -66,6 +66,28 @@ function buildFriendIdentifierSet(friends) {
   return identifiers;
 }
 
+function buildGroupMemberRole(group, memberProfile, memberUserId) {
+  const normalizedUserId = String(memberUserId || '').trim();
+  if (!normalizedUserId) return 'Thành viên';
+
+  if (String(group?.creatorId || '').trim() === normalizedUserId) {
+    return 'Trưởng nhóm';
+  }
+
+  if (Number(memberProfile?.isAdmin) === 1 || Number(memberProfile?.is_admin) === 1) {
+    return 'Phó nhóm';
+  }
+
+  return 'Thành viên';
+}
+
+function buildRelationLabel(relation) {
+  if (Number(relation?.is_friend) === 1) return 'Bạn bè';
+  if (Number(relation?.is_requested) === 1) return 'Đã gửi lời mời cho bạn';
+  if (Number(relation?.is_requesting) === 1) return 'Bạn đã gửi lời mời';
+  return 'Chưa kết bạn';
+}
+
 export function extractGroupMemberIds(group) {
   const ids = new Set();
 
@@ -168,7 +190,138 @@ export function normalizeReceivedFriendRequests(response) {
     : [];
 }
 
-export async function resolveInviteTargetsFromGroups(api, groups, accountUserId) {
+export async function resolveGroupMembersOnly(api, groups, accountUserId) {
+  const groupIds = groups
+    .map((group) => normalizeThreadId(group?.groupId || group?.zid, true))
+    .filter(Boolean);
+
+  if (!groupIds.length) {
+    return { membersByGroup: {} };
+  }
+
+  const groupInfo = await api.getGroupInfo(groupIds);
+  const selfId = String(accountUserId || '').trim();
+  const membersByGroup = {};
+
+  for (const groupId of groupIds) {
+    const group = groupInfo?.gridInfoMap?.[groupId];
+    if (!group) {
+      console.log('[members] group not found in gridInfoMap:', groupId);
+      continue;
+    }
+
+    const adminIdSet = new Set(
+      (Array.isArray(group.adminIds) ? group.adminIds : []).map((id) => String(id).trim()).filter(Boolean),
+    );
+    const creatorId = String(group.creatorId || '').trim();
+
+    const memberVersionKeys = extractGroupMemberIds(group)
+      .map((memberId) => normalizeMemberVersionKey(memberId))
+      .filter(Boolean);
+
+    console.log('[members] group:', groupId, 'name:', group?.name, 'memberKeys:', memberVersionKeys.length);
+
+    if (!memberVersionKeys.length) {
+      membersByGroup[groupId] = [];
+      continue;
+    }
+
+    const currentMemsMap = {};
+    if (Array.isArray(group.currentMems)) {
+      group.currentMems.forEach((mem) => {
+        const id = String(mem?.id || '').trim();
+        if (id) currentMemsMap[id] = mem;
+        const versionedId = `${id}_0`;
+        if (id) currentMemsMap[versionedId] = mem;
+      });
+    }
+    console.log('[members] currentMems:', (group.currentMems || []).length);
+
+    const profileChunks = chunk(memberVersionKeys, 200);
+    const groupProfileMap = {};
+    const userInfoMap = {};
+
+    for (const ids of profileChunks) {
+      if (!ids.length) continue;
+
+      const [groupMembersResponse, userInfoResponse] = await Promise.all([
+        safeApiCall(
+          () => withTimeout(api.getGroupMembersInfo(ids), 15000, 'Lấy thành viên nhóm quá chậm.'),
+          { profiles: {} },
+        ),
+        safeApiCall(
+          () => withTimeout(api.getUserInfo(ids), 15000, 'Lấy hồ sơ thành viên quá chậm.'),
+          { changed_profiles: {} },
+        ),
+      ]);
+
+      const gmProfiles = groupMembersResponse?.profiles || {};
+      const uiProfiles = userInfoResponse?.changed_profiles || {};
+      console.log('[members] getGroupMembersInfo:', Object.keys(gmProfiles).length,
+        'getUserInfo:', Object.keys(uiProfiles).length);
+
+      // Index profiles by BOTH plain and versioned keys (API may return either format)
+      for (const [key, profile] of Object.entries(gmProfiles)) {
+        groupProfileMap[key] = profile;
+        const plain = key.replace(/_\d+$/, '');
+        if (plain !== key) groupProfileMap[plain] = profile;
+        else groupProfileMap[`${key}_0`] = profile;
+      }
+      for (const [key, profile] of Object.entries(uiProfiles)) {
+        userInfoMap[key] = profile;
+        const plain = key.replace(/_\d+$/, '');
+        if (plain !== key) userInfoMap[plain] = profile;
+        else userInfoMap[`${key}_0`] = profile;
+      }
+    }
+
+    membersByGroup[groupId] = memberVersionKeys.map((memberKey) => {
+      const plainKey = memberKey.replace(/_\d+$/, '');
+      const uiProfile = userInfoMap[memberKey] || userInfoMap[plainKey] || {};
+      const gmProfile = groupProfileMap[memberKey] || groupProfileMap[plainKey] || {};
+      const actualUserId = String(
+        uiProfile?.userId || uiProfile?.id || gmProfile?.userId || gmProfile?.id || plainKey,
+      ).trim();
+
+      if (!actualUserId || actualUserId === selfId) return null;
+
+      const currentMem = currentMemsMap[actualUserId] || currentMemsMap[memberKey] || currentMemsMap[plainKey] || {};
+      const displayName = uiProfile.displayName || uiProfile.zaloName
+        || gmProfile.displayName || gmProfile.zaloName
+        || currentMem.dName || currentMem.zaloName || '';
+      const avatar = uiProfile.avatar || gmProfile.avatar || currentMem.avatar || currentMem.avatar_25 || '';
+
+      let role = 'Thành viên';
+      if (creatorId && creatorId === actualUserId) {
+        role = 'Trưởng nhóm';
+      } else if (adminIdSet.has(actualUserId) || Number(gmProfile?.isAdmin) === 1) {
+        role = 'Phó nhóm';
+      }
+
+      const isFriend = Number(uiProfile?.isFr) === 1;
+
+      return {
+        key: `${groupId}_${actualUserId}`,
+        zid: actualUserId,
+        name: displayName || 'Thành viên',
+        avatar,
+        phone: '—',
+        role,
+        relationLabel: isFriend ? 'Bạn bè' : 'Chưa kết bạn',
+        isFriend,
+        sourceTab: group?.name || 'Nhóm',
+        groupId,
+      };
+    }).filter(Boolean);
+
+    console.log('[members] result:', membersByGroup[groupId].length,
+      'with names:', membersByGroup[groupId].filter((m) => m.name !== 'Thành viên').length);
+  }
+
+  return { membersByGroup };
+}
+
+export async function resolveInviteTargetsFromGroups(api, groups, accountUserId, options = {}) {
   const groupIds = groups
     .map((group) => normalizeThreadId(group?.groupId || group?.zid, true))
     .filter(Boolean);
@@ -215,19 +368,30 @@ export async function resolveInviteTargetsFromGroups(api, groups, accountUserId)
         () => withTimeout(api.getGroupMembersInfo(ids), 15000, 'Lấy thành viên nhóm quá chậm.'),
         { profiles: {} },
       );
-      Object.assign(groupProfileMap, groupMembersResponse?.profiles || {});
+      for (const [key, profile] of Object.entries(groupMembersResponse?.profiles || {})) {
+        groupProfileMap[key] = profile;
+        const plain = key.replace(/_\d+$/, '');
+        if (plain !== key) groupProfileMap[plain] = profile;
+        else groupProfileMap[`${key}_0`] = profile;
+      }
 
       const userInfoResponse = await safeApiCall(
         () => withTimeout(api.getUserInfo(ids), 15000, 'Lấy hồ sơ thành viên quá chậm.'),
         { changed_profiles: {} },
       );
-      Object.assign(userInfoMap, userInfoResponse?.changed_profiles || {});
+      for (const [key, profile] of Object.entries(userInfoResponse?.changed_profiles || {})) {
+        userInfoMap[key] = profile;
+        const plain = key.replace(/_\d+$/, '');
+        if (plain !== key) userInfoMap[plain] = profile;
+        else userInfoMap[`${key}_0`] = profile;
+      }
     }
 
     const relationStatuses = new Map();
     for (const memberKey of relevantMemberKeys) {
-      const profile = userInfoMap[memberKey] || groupProfileMap[memberKey] || {};
-      const actualUserId = String(profile?.userId || profile?.id || '').trim();
+      const plainKey = memberKey.replace(/_\d+$/, '');
+      const profile = userInfoMap[memberKey] || userInfoMap[plainKey] || groupProfileMap[memberKey] || groupProfileMap[plainKey] || {};
+      const actualUserId = String(profile?.userId || profile?.id || plainKey).trim();
 
       if (!actualUserId || actualUserId === selfId) {
         continue;
@@ -269,8 +433,9 @@ export async function resolveInviteTargetsFromGroups(api, groups, accountUserId)
     }
 
     const candidateKeys = relevantMemberKeys.filter((memberKey) => {
-      const profile = userInfoMap[memberKey] || groupProfileMap[memberKey] || {};
-      const actualUserId = String(profile?.userId || profile?.id || '').trim();
+      const plainKey = memberKey.replace(/_\d+$/, '');
+      const profile = userInfoMap[memberKey] || userInfoMap[plainKey] || groupProfileMap[memberKey] || groupProfileMap[plainKey] || {};
+      const actualUserId = String(profile?.userId || profile?.id || plainKey).trim();
       if (!actualUserId || actualUserId === selfId) return false;
 
       const relation = relationStatuses.get(memberKey) || {};
@@ -307,8 +472,9 @@ export async function resolveInviteTargetsFromGroups(api, groups, accountUserId)
     }
 
     candidateKeys.forEach((memberKey) => {
-      const profile = userInfoMap[memberKey] || groupProfileMap[memberKey] || {};
-      const actualUserId = String(profile?.userId || profile?.id || '').trim();
+      const plainKey = memberKey.replace(/_\d+$/, '');
+      const profile = userInfoMap[memberKey] || userInfoMap[plainKey] || groupProfileMap[memberKey] || groupProfileMap[plainKey] || {};
+      const actualUserId = String(profile?.userId || profile?.id || plainKey).trim();
       if (!actualUserId) return;
 
       targets.push({

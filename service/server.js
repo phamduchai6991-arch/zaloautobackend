@@ -20,12 +20,17 @@ const server = createServer(async (req, res) => {
   setCorsHeaders(res, req);
 
   if (!hasAllowedOrigin(req)) {
+    console.log(`[BLOCKED] ${req.method} ${req.url} origin=${getRequestOrigin(req)}`);
     writeJson(res, 403, {
       ok: false,
       error: 'Origin hiện tại chưa được local service cho phép. Hãy cấu hình ZALOWEB_ALLOWED_ORIGINS trước khi gọi từ web app đã deploy.',
       origin: getRequestOrigin(req),
     });
     return;
+  }
+
+  if (req.method !== 'OPTIONS') {
+    console.log(`[REQ] ${req.method} ${req.url}`);
   }
 
   if (req.method === 'OPTIONS') {

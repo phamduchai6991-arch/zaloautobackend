@@ -8,6 +8,7 @@ import {
   normalizeReceivedFriendRequests,
   normalizeSentFriendRequests,
   normalizeThreadId,
+  resolveGroupMembersOnly,
   resolveInviteTargetsFromGroups,
   safeApiCall,
   sleep,
@@ -239,6 +240,7 @@ export async function handleFriendRequestBatch(req, res, body) {
 export async function handleGroupInviteTargets(req, res, body) {
   const account = body?.account;
   const groups = Array.isArray(body?.groups) ? body.groups : [];
+  const includeAllMembers = body?.includeAllMembers === true;
 
   if (!account) {
     writeJson(res, 400, { ok: false, error: 'Thiếu account để lấy thành viên nhóm.' });
@@ -256,6 +258,16 @@ export async function handleGroupInviteTargets(req, res, body) {
     ({ api } = await createApiClient(account, userAgent));
   } catch (error) {
     writeServiceLoginError(res, error);
+    return;
+  }
+
+  if (includeAllMembers) {
+    const result = await resolveGroupMembersOnly(api, groups, account?.userId);
+    writeJson(res, 200, {
+      ok: true,
+      membersByGroup: result.membersByGroup || {},
+      provider: 'local-service',
+    });
     return;
   }
 
