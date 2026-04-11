@@ -36,7 +36,7 @@ import {
 } from '../service/lib/handlers.js';
 import { createApiClient, getUserAgent } from '../service/lib/apiClient.js';
 import { isGroupJob, normalizeThreadId, getDelayMs, sleep } from '../service/lib/zaloHelpers.js';
-import { ThreadType } from 'zalo-api-final';
+import { MuteAction, MuteDuration, ThreadType } from 'zalo-api-final';
 
 // ─── Streaming NDJSON helpers ────────────────────────────
 
@@ -264,6 +264,198 @@ async function handleFriendRequestBatchStream(req, res, body) {
           startedAt, failedAt: new Date().toISOString(), provider: 'server',
         });
       }
+    }
+
+    if (index < jobs.length - 1) {
+      const delayMs = getDelayMs(job?.delayWindow);
+      if (delayMs > 0) await sleep(delayMs);
+    }
+  }
+
+  writeNdjsonLine(res, { _done: true, ok: true, accepted, failed });
+  res.end();
+}
+
+async function handleActionBatchStream(req, res, body) {
+  const account = body?.account;
+  const jobs = Array.isArray(body?.jobs) ? body.jobs : [];
+
+  if (!account) {
+    writeJson(res, 400, { ok: false, error: 'Thiếu account để thực thi thao tác.' });
+    return;
+  }
+  if (!jobs.length) {
+    writeJson(res, 400, { ok: false, error: 'Danh sách thao tác rỗng.' });
+    return;
+  }
+
+  const userAgent = getUserAgent(body, req);
+  let api;
+  try {
+    ({ api } = await createApiClient(account, userAgent));
+  } catch (error) {
+    writeJson(res, 500, {
+      ok: false,
+      error: error instanceof Error ? error.message : 'Không thể khởi tạo phiên Zalo.',
+      code: 'SERVICE_LOGIN_FAILED',
+    });
+    return;
+  }
+
+  // ensureCustomApiActions inline
+  if (typeof api?.custom === 'function' && typeof api.rejectFriendRequest !== 'function') {
+    api.custom('rejectFriendRequest', async ({ ctx, utils, props }) => {
+      const userId = String(props?.userId || props || '').trim();
+      const serviceURL = utils.makeURL(`${api.zpwServiceMap.friend[0]}/api/friend/reject`);
+      const encryptedParams = utils.encodeAES(JSON.stringify({ fid: userId, language: ctx.language }));
+      if (!encryptedParams) throw new Error('Failed to encrypt params');
+      const response = await utils.request(serviceURL, {
+        method: 'POST',
+        body: new URLSearchParams({ params: encryptedParams }),
+      });
+      return utils.resolve(response);
+    });
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'application/x-ndjson',
+    'Transfer-Encoding': 'chunked',
+    'Cache-Control': 'no-cache',
+  });
+
+  let accepted = 0;
+  let failed = 0;
+
+  const ACTION_LABELS = {
+    remove_friend: { running: 'Đang xóa bạn', ok: 'Đã xóa bạn', fail: 'Xóa bạn thất bại' },
+    leave_group: { running: 'Đang rời nhóm', ok: 'Đã rời nhóm', fail: 'Rời nhóm thất bại' },
+    undo_friend_request: { running: 'Đang thu hồi lời mời', ok: 'Đã thu hồi lời mời', fail: 'Thu hồi lời mời thất bại' },
+    accept_friend_request: { running: 'Đang chấp nhận lời mời', ok: 'Đã chấp nhận lời mời', fail: 'Chấp nhận lời mời thất bại' },
+    reject_friend_request: { running: 'Đang từ chối lời mời', ok: 'Đã từ chối lời mời', fail: 'Từ chối lời mời thất bại' },
+    pull_group: { running: 'Đang mời vào nhóm', ok: 'Đã mời vào nhóm', fail: 'Kéo nhóm thất bại' },
+    join_group: { running: 'Đang tham gia nhóm', ok: 'Đã tham gia nhóm', fail: 'Tham gia nhóm thất bại' },
+    mute: { running: 'Đang tắt thông báo', ok: 'Đã tắt thông báo', fail: 'Tắt thông báo thất bại' },
+    unmute: { running: 'Đang bật thông báo', ok: 'Đã bật thông báo', fail: 'Bật thông báo thất bại' },
+  };
+
+  for (let index = 0; index < jobs.length; index += 1) {
+    const job = jobs[index];
+    const actionType = String(job?.actionType || '').trim();
+    const groupJob = isGroupJob(job);
+    const zid = normalizeThreadId(job?.zid, groupJob);
+    const startedAt = new Date().toISOString();
+    const labels = ACTION_LABELS[actionType] || { running: 'Đang xử lý', ok: 'Hoàn tất', fail: 'Thất bại' };
+    const itemName = job?.name || job?.zid || '';
+
+    writeNdjsonLine(res, {
+      jobId: job.id,
+      status: 'running',
+      statusLabel: `${labels.running} ${index + 1}/${jobs.length}${itemName ? ': ' + itemName : ''}`,
+      startedAt,
+      provider: 'server',
+    });
+
+    if (!zid || zid === '—') {
+      failed++;
+      writeNdjsonLine(res, {
+        jobId: job?.id, ok: false, status: 'failed',
+        statusLabel: 'Thiếu Zalo ID',
+        error: 'Không tìm thấy Zalo ID hợp lệ.',
+        startedAt, failedAt: new Date().toISOString(), provider: 'server',
+      });
+      continue;
+    }
+
+    try {
+      let apiResult;
+      let statusLabel = labels.ok;
+
+      if (actionType === 'remove_friend') {
+        if (groupJob) throw new Error('Xóa bạn bè không áp dụng cho nhóm.');
+        apiResult = await api.removeFriend(zid);
+      } else if (actionType === 'leave_group') {
+        if (!groupJob) throw new Error('Rời nhóm chỉ áp dụng cho hội thoại nhóm.');
+        apiResult = await api.leaveGroup(zid);
+        const memberErrors = Array.isArray(apiResult?.memberError) ? apiResult.memberError : [];
+        if (memberErrors.includes(zid)) throw new Error('Zalo từ chối thao tác rời nhóm.');
+      } else if (actionType === 'undo_friend_request') {
+        if (groupJob) throw new Error('Thu hồi lời mời không áp dụng cho nhóm.');
+        apiResult = await api.undoFriendRequest(zid);
+      } else if (actionType === 'accept_friend_request') {
+        if (groupJob) throw new Error('Chấp nhận lời mời không áp dụng cho nhóm.');
+        apiResult = await api.acceptFriendRequest(zid);
+      } else if (actionType === 'reject_friend_request') {
+        if (groupJob) throw new Error('Từ chối lời mời không áp dụng cho nhóm.');
+        apiResult = await api.rejectFriendRequest(zid);
+      } else if (actionType === 'pull_group') {
+        if (groupJob) throw new Error('Kéo nhóm không áp dụng cho hội thoại nhóm.');
+        const targetGroupId = normalizeThreadId(job?.targetGroupId, true);
+        if (!targetGroupId || targetGroupId === '—') throw new Error('Chưa chọn nhóm đích.');
+        apiResult = await api.addUserToGroup(zid, targetGroupId);
+        const errorMembers = Array.isArray(apiResult?.errorMembers) ? apiResult.errorMembers : [];
+        if (errorMembers.includes(zid)) {
+          throw new Error(apiResult?.error_data?.[zid]?.[0] || 'Không thể mời vào nhóm.');
+        }
+        statusLabel = `Đã mời vào ${job?.targetGroupName || 'nhóm'}`;
+      } else if (actionType === 'join_group') {
+        const inviteLink = String(job?.inviteLink || job?.link || '').trim();
+        if (!inviteLink) throw new Error('Không tìm thấy link mời nhóm.');
+        try {
+          apiResult = await api.joinGroupLink(inviteLink);
+        } catch (err) {
+          const code = typeof err?.code === 'number' ? err.code : null;
+          if (code === 178) {
+            accepted++;
+            writeNdjsonLine(res, {
+              jobId: job.id, ok: true, status: 'skipped',
+              statusLabel: 'Đã ở trong nhóm',
+              startedAt, sentAt: new Date().toISOString(), provider: 'server',
+            });
+            if (index < jobs.length - 1) {
+              const delayMs = getDelayMs(job?.delayWindow);
+              if (delayMs > 0) await sleep(delayMs);
+            }
+            continue;
+          } else if (code === 240) {
+            accepted++;
+            writeNdjsonLine(res, {
+              jobId: job.id, ok: true, status: 'pending',
+              statusLabel: 'Đã gửi yêu cầu vào nhóm',
+              startedAt, sentAt: new Date().toISOString(), provider: 'server',
+            });
+            if (index < jobs.length - 1) {
+              const delayMs = getDelayMs(job?.delayWindow);
+              if (delayMs > 0) await sleep(delayMs);
+            }
+            continue;
+          }
+          throw err;
+        }
+      } else if (actionType === 'mute' || actionType === 'unmute') {
+        const threadType = groupJob ? ThreadType.Group : ThreadType.User;
+        const params = actionType === 'mute'
+          ? { action: MuteAction.MUTE, duration: MuteDuration.FOREVER }
+          : { action: MuteAction.UNMUTE };
+        apiResult = await api.setMute(params, zid, threadType);
+      } else {
+        throw new Error(`Action không được hỗ trợ: ${actionType || 'unknown'}.`);
+      }
+
+      accepted++;
+      writeNdjsonLine(res, {
+        jobId: job.id, ok: true, status: 'completed',
+        statusLabel: `${statusLabel}${itemName ? ': ' + itemName : ''}`,
+        startedAt, sentAt: new Date().toISOString(), provider: 'server',
+        apiResult,
+      });
+    } catch (error) {
+      failed++;
+      writeNdjsonLine(res, {
+        jobId: job?.id, ok: false, status: 'failed',
+        statusLabel: `${labels.fail}${itemName ? ': ' + itemName : ''}`,
+        error: error instanceof Error ? error.message : 'Thực thi thao tác thất bại.',
+        startedAt, failedAt: new Date().toISOString(), provider: 'server',
+      });
     }
 
     if (index < jobs.length - 1) {
@@ -528,7 +720,7 @@ const server = createServer(async (req, res) => {
 
       if (req.method === 'POST' && url === '/api/zalo/actions/batch') {
         const body = await readBody(req);
-        return handleActionBatch(req, res, body);
+        return handleActionBatchStream(req, res, body);
       }
 
       // ─── AI Rewrite (DeepSeek proxy) ───
