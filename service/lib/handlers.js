@@ -237,6 +237,72 @@ export async function handleFriendRequestBatch(req, res, body) {
   });
 }
 
+export async function handleFindUser(req, res, body) {
+  const account = body?.account;
+  const phones = Array.isArray(body?.phones) ? body.phones : [];
+
+  if (!account) {
+    writeJson(res, 400, { ok: false, error: 'Thiếu account để tra cứu SĐT.' });
+    return;
+  }
+
+  if (!phones.length) {
+    writeJson(res, 400, { ok: false, error: 'Danh sách SĐT rỗng.' });
+    return;
+  }
+
+  const userAgent = getUserAgent(body, req);
+  let api;
+  try {
+    ({ api } = await createApiClient(account, userAgent));
+  } catch (error) {
+    writeServiceLoginError(res, error);
+    return;
+  }
+
+  const results = [];
+  for (const phone of phones.slice(0, 50)) {
+    const phoneStr = String(phone || '').trim();
+    if (!phoneStr) continue;
+
+    try {
+      const result = await withTimeout(
+        api.findUser(phoneStr),
+        10000,
+        `Tra cứu SĐT ${phoneStr} quá chậm.`,
+      );
+
+      if (result && result.uid) {
+        results.push({
+          phone: phoneStr,
+          found: true,
+          uid: result.uid,
+          displayName: result.display_name || result.zalo_name || '',
+          zaloName: result.zalo_name || '',
+          avatar: result.avatar || '',
+          gender: result.gender || '',
+          status: result.status || '',
+          globalId: result.globalId || '',
+        });
+      } else {
+        results.push({ phone: phoneStr, found: false, error: 'Không tìm thấy tài khoản Zalo.' });
+      }
+    } catch (error) {
+      results.push({
+        phone: phoneStr,
+        found: false,
+        error: error instanceof Error ? error.message : 'Lỗi khi tra cứu.',
+      });
+    }
+
+    if (phones.length > 1) {
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
+
+  writeJson(res, 200, { ok: true, results, provider: 'local-service' });
+}
+
 export async function handleGroupInviteTargets(req, res, body) {
   const account = body?.account;
   const groups = Array.isArray(body?.groups) ? body.groups : [];

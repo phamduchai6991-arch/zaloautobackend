@@ -11,6 +11,7 @@ import {
 import {
   handleAccountSync,
   handleActionBatch,
+  handleFindUser,
   handleFriendRequestBatch,
   handleGroupInviteTargets,
   handleSendBatch,
@@ -71,6 +72,12 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && req.url === '/api/zalo/groups/invite-targets') {
       const body = await readRequestBody(req);
       await handleGroupInviteTargets(req, res, body);
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/api/zalo/find-user') {
+      const body = await readRequestBody(req);
+      await handleFindUser(req, res, body);
       return;
     }
 
