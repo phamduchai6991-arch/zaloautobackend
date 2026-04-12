@@ -514,20 +514,56 @@
       console.warn('[ZaloMain] Failed to load dThN:', e.message);
     }
 
-    // Load AES encoder module (z0WU) — needed for decodeAES hook
-    try {
-      var z0WU = _wr('z0WU');
-      _encoderModule = z0WU && z0WU.default;
-    } catch (e) {
-      console.warn('[ZaloMain] Failed to load z0WU:', e.message);
+    // Load AES encoder module — needed for decodeAES hook
+    // Try known ID first, then search all webpack modules dynamically
+    var knownEncoderIds = ['z0WU', 'ZEncoder', 'aes_utils'];
+    for (var ki = 0; ki < knownEncoderIds.length && !_encoderModule; ki++) {
+      try {
+        var eMod = _wr(knownEncoderIds[ki]);
+        var eDef = eMod && (eMod.default || eMod);
+        if (eDef && typeof eDef.decodeAES === 'function') {
+          _encoderModule = eDef;
+          console.log('[ZaloMain] Found encoder module via known ID:', knownEncoderIds[ki]);
+        }
+      } catch (_) {}
     }
 
-    // Load domains module (pUq9) — contains domain mappings
-    try {
-      var pUq9 = _wr('pUq9');
-      _domainsModule = pUq9;
-    } catch (e) {
-      console.warn('[ZaloMain] Failed to load pUq9:', e.message);
+    // Dynamic search: iterate webpack module cache to find decodeAES
+    if (!_encoderModule && _wr && _wr.c) {
+      var moduleCache = _wr.c;
+      var cacheKeys = Object.keys(moduleCache);
+      console.log('[ZaloMain] Searching', cacheKeys.length, 'webpack modules for decodeAES...');
+      for (var ci = 0; ci < cacheKeys.length; ci++) {
+        try {
+          var cachedMod = moduleCache[cacheKeys[ci]];
+          var exp = cachedMod && cachedMod.exports;
+          if (!exp) continue;
+          // Check exports.default.decodeAES
+          if (exp.default && typeof exp.default.decodeAES === 'function') {
+            _encoderModule = exp.default;
+            console.log('[ZaloMain] Found encoder module by scanning cache, key:', cacheKeys[ci]);
+            break;
+          }
+          // Check exports.decodeAES directly
+          if (typeof exp.decodeAES === 'function') {
+            _encoderModule = exp;
+            console.log('[ZaloMain] Found encoder module (direct export), key:', cacheKeys[ci]);
+            break;
+          }
+        } catch (_) {}
+      }
+    }
+
+    if (!_encoderModule) {
+      console.warn('[ZaloMain] decodeAES module NOT found — lockViewMember bypass unavailable');
+    }
+
+    // Load domains module — try known IDs
+    var knownDomainIds = ['pUq9', 'domains'];
+    for (var di = 0; di < knownDomainIds.length && !_domainsModule; di++) {
+      try {
+        _domainsModule = _wr(knownDomainIds[di]);
+      } catch (_) {}
     }
 
     // Hook decodeAES to bypass lockViewMember (Zalo-F12 approach)
@@ -1580,10 +1616,10 @@
     if (_encoderModule && _encoderModule._zalotool_hooked) {
       console.log('[ZaloMain] decodeAES hook confirmed active');
     } else {
-      console.warn('[ZaloMain] decodeAES hook NOT active — lockViewMember bypass may not work');
+      console.warn('[ZaloMain] decodeAES hook NOT active — will use raw HTTP fallback');
     }
 
-    // Call getGroupInfos with pagination support (mcount=500 per page)
+    // Strategy 1: Call getGroupInfos (with decodeAES hook if active)
     var apiSuccess = false;
     var mpage = 1;
     var maxPages = 10;
@@ -1606,7 +1642,6 @@
           if (!groupInfoMap[gid]) {
             groupInfoMap[gid] = gdata;
           } else {
-            // Merge additional members from subsequent pages
             var existing = groupInfoMap[gid];
             if (Array.isArray(gdata.currentMems) && gdata.currentMems.length) {
               existing.currentMems = (existing.currentMems || []).concat(gdata.currentMems);
@@ -1620,7 +1655,6 @@
           }
         });
 
-        // Check hasMoreMember for any group
         var hasMore = false;
         Object.keys(gmap).forEach(function (gid) {
           if (Number(gmap[gid].hasMoreMember) > 0) hasMore = true;
@@ -1630,6 +1664,177 @@
       } catch (e) {
         console.warn('[ZaloMain] getGroupInfos page', mpage + page, 'failed:', e.message);
         break;
+      }
+    }
+
+    // Check if we got enough members — if not, try raw HTTP fallback
+    var needsRawFallback = false;
+    if (!apiSuccess) {
+      needsRawFallback = true;
+      console.log('[ZaloMain] getGroupInfos returned nothing, trying raw HTTP');
+    } else {
+      Object.keys(groupInfoMap).forEach(function (gid) {
+        var g = groupInfoMap[gid];
+        var totalFromApi = (g.currentMems || []).length + (g.memVerList || []).length;
+        var total = Number(g.totalMember) || 0;
+        if (total > 10 && totalFromApi < total * 0.5) {
+          needsRawFallback = true;
+          console.log('[ZaloMain] Group', gid, 'has', totalFromApi, 'members from API but totalMember is', total, '— needs raw fallback');
+        }
+      });
+    }
+
+    // Strategy 2: Raw HTTP fetch — bypass Zalo's client-side filtering entirely
+    if (needsRawFallback && _encoderModule && typeof _encoderModule.encodeAES === 'function') {
+      console.log('[ZaloMain] Attempting raw HTTP to /api/group/getmg-v2...');
+      try {
+        var gridVerMap = {};
+        groupIds.forEach(function (gid) { gridVerMap[gid] = 0; });
+        var rawParams = JSON.stringify({ gridVerMap: JSON.stringify(gridVerMap) });
+        var encryptedParams = _encoderModule.encodeAES(rawParams);
+
+        if (!encryptedParams) {
+          console.warn('[ZaloMain] encodeAES returned null');
+        } else {
+          var groupDomains = [];
+          try {
+            if (_httpModule && _httpModule._zpwServiceMap) {
+              var smap = _httpModule._zpwServiceMap;
+              if (smap.group && Array.isArray(smap.group)) groupDomains = smap.group;
+            }
+          } catch (_) {}
+
+          if (!groupDomains.length && _wr && _wr.c) {
+            var wrCache = _wr.c;
+            var wrKeys = Object.keys(wrCache);
+            for (var wki = 0; wki < wrKeys.length && !groupDomains.length; wki++) {
+              try {
+                var wmod = wrCache[wrKeys[wki]];
+                var wexp = wmod && wmod.exports;
+                if (!wexp) continue;
+                var smap2 = wexp.zpwServiceMap || wexp.default && wexp.default.zpwServiceMap ||
+                            wexp.zpw_service_map_v3 || wexp.default && wexp.default.zpw_service_map_v3;
+                if (smap2 && smap2.group && Array.isArray(smap2.group)) {
+                  groupDomains = smap2.group;
+                  console.log('[ZaloMain] Found zpwServiceMap.group from webpack cache key:', wrKeys[wki]);
+                }
+              } catch (_) {}
+            }
+          }
+
+          if (!groupDomains.length) {
+            [window.localStorage, window.sessionStorage].forEach(function (storage) {
+              if (!storage || groupDomains.length) return;
+              for (var si = 0; si < storage.length; si++) {
+                try {
+                  var sk = storage.key(si);
+                  var sv = storage.getItem(sk);
+                  if (sv && sv.indexOf('zpw_service_map') !== -1) {
+                    var parsed = JSON.parse(sv);
+                    var m = parsed.zpw_service_map_v3 || parsed;
+                    if (m.group && Array.isArray(m.group)) {
+                      groupDomains = m.group;
+                      console.log('[ZaloMain] Found zpwServiceMap.group from storage key:', sk);
+                    }
+                  }
+                } catch (_) {}
+              }
+            });
+          }
+
+          if (!groupDomains.length) {
+            try {
+              var perfEntries = performance.getEntriesByType('resource');
+              for (var pi = 0; pi < perfEntries.length; pi++) {
+                var pUrl = perfEntries[pi].name || '';
+                if (pUrl.indexOf('/api/group/') !== -1) {
+                  var domainMatch = pUrl.match(/^(https?:\/\/[^/]+)/);
+                  if (domainMatch) {
+                    groupDomains.push(domainMatch[1]);
+                    console.log('[ZaloMain] Found group domain from performance API:', domainMatch[1]);
+                    break;
+                  }
+                }
+              }
+            } catch (_) {}
+          }
+
+          var commonQs = '';
+          try {
+            if (_httpModule && typeof _httpModule._getCommonParams === 'function') {
+              commonQs = _httpModule._getCommonParams();
+            }
+          } catch (_) {}
+          if (!commonQs) commonQs = 'zpw_ver=645&zpw_type=30';
+
+          if (groupDomains.length) {
+            for (var gdi = 0; gdi < groupDomains.length; gdi++) {
+              try {
+                var rawUrl = groupDomains[gdi] + '/api/group/getmg-v2?' + commonQs;
+                console.log('[ZaloMain] raw HTTP fetch to:', rawUrl.substring(0, 80));
+
+                var rawResponse = await withTimeout(
+                  fetch(rawUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: 'params=' + encodeURIComponent(encryptedParams),
+                    credentials: 'include',
+                  }).then(function (r) { return r.json(); }),
+                  20000, null
+                );
+
+                console.log('[ZaloMain] raw HTTP response:', rawResponse ? 'error_code=' + rawResponse.error_code : 'null');
+
+                if (rawResponse && rawResponse.error_code === 0 && rawResponse.data) {
+                  var decryptedStr = null;
+                  var decFn = _encoderModule.decodeAES_original || _encoderModule.decodeAES;
+                  if (typeof decFn === 'function') {
+                    decryptedStr = decFn(rawResponse.data, 0);
+                  }
+
+                  if (decryptedStr) {
+                    var decryptedJson = JSON.parse(decryptedStr);
+                    console.log('[ZaloMain] raw HTTP decrypted, error_code:', decryptedJson.error_code);
+
+                    var rawGridMap = null;
+                    if (decryptedJson.data && decryptedJson.data.gridInfoMap) {
+                      rawGridMap = decryptedJson.data.gridInfoMap;
+                    } else if (decryptedJson.gridInfoMap) {
+                      rawGridMap = decryptedJson.gridInfoMap;
+                    }
+
+                    if (rawGridMap) {
+                      apiSuccess = true;
+                      Object.keys(rawGridMap).forEach(function (gid) {
+                        var g = rawGridMap[gid];
+                        if (g && g.setting) g.setting.lockViewMember = 0;
+                        groupInfoMap[gid] = g;
+                      });
+                      console.log('[ZaloMain] raw HTTP got', Object.keys(rawGridMap).length, 'groups');
+                      Object.keys(rawGridMap).forEach(function (gid) {
+                        var rg = rawGridMap[gid];
+                        console.log('[ZaloMain] raw group', gid,
+                          'totalMember:', rg.totalMember,
+                          'currentMems:', (rg.currentMems || []).length,
+                          'memVerList:', (rg.memVerList || []).length,
+                          'memberIds:', (rg.memberIds || []).length);
+                      });
+                      break;
+                    }
+                  } else {
+                    console.warn('[ZaloMain] raw HTTP: decodeAES returned null');
+                  }
+                }
+              } catch (e) {
+                console.warn('[ZaloMain] raw HTTP domain', groupDomains[gdi], 'failed:', e.message);
+              }
+            }
+          } else {
+            console.warn('[ZaloMain] Could not find group API domain for raw HTTP');
+          }
+        }
+      } catch (e) {
+        console.warn('[ZaloMain] raw HTTP fallback failed:', e.message, e.stack);
       }
     }
 
