@@ -1516,7 +1516,7 @@
     var existingFriendIds = buildFriendIdentifierSet(friends);
 
     // Step 1: Fetch group info via _httpModule.getGroupInfos (fBUP) with pagination
-    // This hits /api/group/getmg with mpage/mcount and returns full currentMems
+    // This hits /api/group/getmg-v2 with gridVerMap to get ALL members (bypasses lockViewMember)
     var groupInfoMap = {};
 
     function extractGridInfoMap(resp) {
@@ -1526,71 +1526,120 @@
       return null;
     }
 
-    // Try getGroupInfos on _httpModule directly (fBUP — the reliable HTTP module)
+    // Strategy 1: Direct raw HTTP via _httpModule._post → /api/group/getmg-v2
+    // This bypasses the business module's lockViewMember filtering
     var apiSuccess = false;
-    if (_httpModule && typeof _httpModule.getGroupInfos === 'function') {
+    if (_httpModule && typeof _httpModule._post === 'function' && typeof _httpModule._encodeParams === 'function') {
       try {
-        var mpage = 1;
-        var mcount = 500;
-        var maxPages = 10;
-        for (var page = 0; page < maxPages; page += 1) {
-          var resp = await withTimeout(_httpModule.getGroupInfos(groupIds, mpage + page, mcount), 15000, null);
-          var gmap = extractGridInfoMap(resp);
-          console.log('[ZaloMain] getGroupInfos page', mpage + page, 'response:', gmap ? Object.keys(gmap).length + ' groups' : 'null');
+        // Build gridVerMap like zalo-api-final does: {groupId: 0, ...}
+        var gridVerMap = {};
+        groupIds.forEach(function (gid) { gridVerMap[gid] = 0; });
+        var params = { gridVerMap: JSON.stringify(gridVerMap) };
+        var encodedParams = _httpModule._encodeParams(params);
 
+        // Get the group domain URL
+        var groupDomain = '';
+        try {
+          // Try accessing domain resolver (p.b.getGroupDomain pattern)
+          if (typeof _httpModule._getDomainByType === 'function') {
+            groupDomain = _httpModule._getDomainByType('GROUP') || _httpModule._getDomainByType('group') || '';
+          }
+          if (!groupDomain && typeof _httpModule.getGroupDomain === 'function') {
+            groupDomain = _httpModule.getGroupDomain();
+          }
+        } catch (_) {}
+
+        // Fallback: try to extract from existing URL patterns in the module
+        if (!groupDomain) {
+          try {
+            // Try to get it from zpwServiceMap or common data
+            var commonParams = typeof _httpModule._getCommonParams === 'function' ? _httpModule._getCommonParams() : 'zpw_ver=681&zpw_type=30';
+
+            // Use origin-relative URL (same origin as chat.zalo.me)
+            // The browser will resolve it against the current page origin
+            groupDomain = '';
+          } catch (_) {}
+        }
+
+        var commonQs = typeof _httpModule._getCommonParams === 'function' ? _httpModule._getCommonParams() : 'zpw_ver=681&zpw_type=30';
+
+        // Build the URL: try domain-based first, then URL config object
+        var postUrl = '';
+        var postBody = 'params=' + encodedParams;
+        var postOpts = { timeout: 20000, withCredentials: true, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } };
+
+        if (groupDomain) {
+          postUrl = groupDomain + '/api/group/getmg-v2?' + commonQs;
+        }
+
+        console.log('[ZaloMain] raw API call: groupDomain=', groupDomain, 'postUrl=', postUrl ? postUrl.substring(0, 80) : 'empty');
+
+        var rawResp = null;
+        if (postUrl) {
+          // Direct URL approach
+          rawResp = await withTimeout(_httpModule._post(postUrl, postBody, postOpts, 12604, 0, false, null), 20000, null);
+        } else {
+          // URL config object approach (let fBUP resolve the domain)
+          var urlConfig = { domainType: 'GROUP', path: '/api/group/getmg-v2', query: commonQs };
+          rawResp = await withTimeout(_httpModule._post(urlConfig, postBody, postOpts, 12604, 0, false, null), 20000, null);
+        }
+
+        console.log('[ZaloMain] raw getmg-v2 response type:', typeof rawResp,
+          'has gridInfoMap:', !!(rawResp && rawResp.gridInfoMap),
+          'has data:', !!(rawResp && rawResp.data));
+        if (rawResp) {
+          console.log('[ZaloMain] raw response keys:', Object.keys(rawResp).join(','));
+          if (rawResp.data && typeof rawResp.data === 'object') {
+            console.log('[ZaloMain] raw response.data keys:', Object.keys(rawResp.data).join(','));
+          }
+        }
+
+        var rawGrid = extractGridInfoMap(rawResp);
+        if (rawGrid && Object.keys(rawGrid).length) {
+          apiSuccess = true;
+          Object.keys(rawGrid).forEach(function (gid) {
+            groupInfoMap[gid] = rawGrid[gid];
+          });
+          console.log('[ZaloMain] raw API got', Object.keys(rawGrid).length, 'groups');
+          Object.keys(rawGrid).forEach(function (gid) {
+            var g = rawGrid[gid];
+            console.log('[ZaloMain] raw group', gid,
+              'totalMember:', g.totalMember,
+              'currentMems:', (g.currentMems || []).length,
+              'memVerList:', (g.memVerList || []).length,
+              'hasMoreMember:', g.hasMoreMember,
+              'lockViewMember:', g.setting && g.setting.lockViewMember);
+          });
+        }
+      } catch (e) {
+        console.warn('[ZaloMain] raw _post to getmg-v2 failed:', e.message, e.stack);
+      }
+    } else {
+      console.log('[ZaloMain] _httpModule._post not available, _post:', typeof (_httpModule && _httpModule._post),
+        '_encodeParams:', typeof (_httpModule && _httpModule._encodeParams));
+    }
+
+    // Strategy 2: Fall back to fBUP.getGroupInfos (may be limited by lockViewMember)
+    if (!apiSuccess || !Object.keys(groupInfoMap).length) {
+      console.log('[ZaloMain] raw API failed, trying fBUP.getGroupInfos');
+      if (_httpModule && typeof _httpModule.getGroupInfos === 'function') {
+        try {
+          var resp = await withTimeout(_httpModule.getGroupInfos(groupIds, 1, 500), 15000, null);
+          var gmap = extractGridInfoMap(resp);
           if (gmap) {
             apiSuccess = true;
             Object.keys(gmap).forEach(function (gid) {
-              var gdata = gmap[gid];
-              if (!groupInfoMap[gid]) {
-                groupInfoMap[gid] = gdata;
-              } else {
-                // Merge additional members from subsequent pages
-                var existing = groupInfoMap[gid];
-                if (Array.isArray(gdata.currentMems) && gdata.currentMems.length) {
-                  existing.currentMems = (existing.currentMems || []).concat(gdata.currentMems);
-                }
-                if (Array.isArray(gdata.memVerList) && gdata.memVerList.length) {
-                  existing.memVerList = (existing.memVerList || []).concat(gdata.memVerList);
-                }
-                if (Array.isArray(gdata.memberIds) && gdata.memberIds.length) {
-                  existing.memberIds = (existing.memberIds || []).concat(gdata.memberIds);
-                }
-              }
+              if (!groupInfoMap[gid]) groupInfoMap[gid] = gmap[gid];
             });
-
-            // Check hasMoreMember for any group
-            var hasMore = false;
-            Object.keys(gmap).forEach(function (gid) {
-              if (Number(gmap[gid].hasMoreMember) > 0) hasMore = true;
-            });
-            if (!hasMore) break;
-            console.log('[ZaloMain] hasMoreMember detected, fetching page', mpage + page + 1);
-          } else {
-            break;
+            console.log('[ZaloMain] getGroupInfos got', Object.keys(gmap).length, 'groups');
           }
+        } catch (e) {
+          console.warn('[ZaloMain] getGroupInfos failed:', e.message);
         }
-      } catch (e) {
-        console.warn('[ZaloMain] getGroupInfos failed:', e.message);
       }
     }
 
-    // Fallback: try callFirstAvailableMethod if direct fBUP call didn't work
-    if (!apiSuccess || !Object.keys(groupInfoMap).length) {
-      console.log('[ZaloMain] fBUP.getGroupInfos unavailable or empty, trying callFirstAvailableMethod');
-      try {
-        var fallbackResp = await withTimeout(callFirstAvailableMethod(['getGroupInfos', 'getGroupInfo'], [groupIds, 1, 500]), 15000, null);
-        var fbMap = extractGridInfoMap(fallbackResp);
-        if (fbMap) {
-          Object.keys(fbMap).forEach(function (gid) {
-            if (!groupInfoMap[gid]) groupInfoMap[gid] = fbMap[gid];
-          });
-          console.log('[ZaloMain] callFirstAvailableMethod got', Object.keys(fbMap).length, 'groups');
-        }
-      } catch (e) {
-        console.warn('[ZaloMain] callFirstAvailableMethod failed:', e.message);
-      }
-    }
+    // Strategy 3: callFirstAvailableMethod as last resort
 
     // Log what we got from API
     Object.keys(groupInfoMap).forEach(function (gid) {
