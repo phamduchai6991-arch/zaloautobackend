@@ -1515,25 +1515,94 @@
     var accountUserId = String((args && args.accountUserId) || (me && me.userId) || buildSessionSnapshot().userId || '').trim();
     var existingFriendIds = buildFriendIdentifierSet(friends);
 
-    // Step 1: Try getGroupInfo API (the most reliable source for member data)
-    var groupInfoResponse = null;
-    try {
-      groupInfoResponse = await withTimeout(callFirstAvailableMethod(['getGroupInfo', 'getGroupInfos'], [groupIds, 1, 500]), 15000, null);
-      console.log('[ZaloMain] getGroupInfo response type:', typeof groupInfoResponse,
-        'gridInfoMap:', groupInfoResponse && groupInfoResponse.gridInfoMap ? Object.keys(groupInfoResponse.gridInfoMap).join(',') : 'null',
-        'data.gridInfoMap:', groupInfoResponse && groupInfoResponse.data && groupInfoResponse.data.gridInfoMap ? Object.keys(groupInfoResponse.data.gridInfoMap).join(',') : 'null');
-    } catch (e) {
-      console.warn('[ZaloMain] getGroupInfo failed:', e.message);
-      groupInfoResponse = null;
+    // Step 1: Fetch group info via _httpModule.getGroupInfos (fBUP) with pagination
+    // This hits /api/group/getmg with mpage/mcount and returns full currentMems
+    var groupInfoMap = {};
+
+    function extractGridInfoMap(resp) {
+      if (!resp) return null;
+      if (resp.gridInfoMap && typeof resp.gridInfoMap === 'object') return resp.gridInfoMap;
+      if (resp.data && resp.data.gridInfoMap && typeof resp.data.gridInfoMap === 'object') return resp.data.gridInfoMap;
+      return null;
     }
 
-    // Build group info map from API response
-    var groupInfoMap = {};
-    if (groupInfoResponse && groupInfoResponse.gridInfoMap && typeof groupInfoResponse.gridInfoMap === 'object') {
-      groupInfoMap = groupInfoResponse.gridInfoMap;
-    } else if (groupInfoResponse && groupInfoResponse.data && groupInfoResponse.data.gridInfoMap && typeof groupInfoResponse.data.gridInfoMap === 'object') {
-      groupInfoMap = groupInfoResponse.data.gridInfoMap;
+    // Try getGroupInfos on _httpModule directly (fBUP — the reliable HTTP module)
+    var apiSuccess = false;
+    if (_httpModule && typeof _httpModule.getGroupInfos === 'function') {
+      try {
+        var mpage = 1;
+        var mcount = 500;
+        var maxPages = 10;
+        for (var page = 0; page < maxPages; page += 1) {
+          var resp = await withTimeout(_httpModule.getGroupInfos(groupIds, mpage + page, mcount), 15000, null);
+          var gmap = extractGridInfoMap(resp);
+          console.log('[ZaloMain] getGroupInfos page', mpage + page, 'response:', gmap ? Object.keys(gmap).length + ' groups' : 'null');
+
+          if (gmap) {
+            apiSuccess = true;
+            Object.keys(gmap).forEach(function (gid) {
+              var gdata = gmap[gid];
+              if (!groupInfoMap[gid]) {
+                groupInfoMap[gid] = gdata;
+              } else {
+                // Merge additional members from subsequent pages
+                var existing = groupInfoMap[gid];
+                if (Array.isArray(gdata.currentMems) && gdata.currentMems.length) {
+                  existing.currentMems = (existing.currentMems || []).concat(gdata.currentMems);
+                }
+                if (Array.isArray(gdata.memVerList) && gdata.memVerList.length) {
+                  existing.memVerList = (existing.memVerList || []).concat(gdata.memVerList);
+                }
+                if (Array.isArray(gdata.memberIds) && gdata.memberIds.length) {
+                  existing.memberIds = (existing.memberIds || []).concat(gdata.memberIds);
+                }
+              }
+            });
+
+            // Check hasMoreMember for any group
+            var hasMore = false;
+            Object.keys(gmap).forEach(function (gid) {
+              if (Number(gmap[gid].hasMoreMember) > 0) hasMore = true;
+            });
+            if (!hasMore) break;
+            console.log('[ZaloMain] hasMoreMember detected, fetching page', mpage + page + 1);
+          } else {
+            break;
+          }
+        }
+      } catch (e) {
+        console.warn('[ZaloMain] getGroupInfos failed:', e.message);
+      }
     }
+
+    // Fallback: try callFirstAvailableMethod if direct fBUP call didn't work
+    if (!apiSuccess || !Object.keys(groupInfoMap).length) {
+      console.log('[ZaloMain] fBUP.getGroupInfos unavailable or empty, trying callFirstAvailableMethod');
+      try {
+        var fallbackResp = await withTimeout(callFirstAvailableMethod(['getGroupInfos', 'getGroupInfo'], [groupIds, 1, 500]), 15000, null);
+        var fbMap = extractGridInfoMap(fallbackResp);
+        if (fbMap) {
+          Object.keys(fbMap).forEach(function (gid) {
+            if (!groupInfoMap[gid]) groupInfoMap[gid] = fbMap[gid];
+          });
+          console.log('[ZaloMain] callFirstAvailableMethod got', Object.keys(fbMap).length, 'groups');
+        }
+      } catch (e) {
+        console.warn('[ZaloMain] callFirstAvailableMethod failed:', e.message);
+      }
+    }
+
+    // Log what we got from API
+    Object.keys(groupInfoMap).forEach(function (gid) {
+      var g = groupInfoMap[gid];
+      console.log('[ZaloMain] API group', gid,
+        'totalMember:', g.totalMember,
+        'currentMems:', (g.currentMems || []).length,
+        'memVerList:', (g.memVerList || []).length,
+        'memberIds:', (g.memberIds || []).length,
+        'hasMoreMember:', g.hasMoreMember,
+        'lockViewMember:', g.setting && g.setting.lockViewMember);
+    });
 
     // Fallback: match from raw zStorage groups (preserves currentMems, memberIds, etc.)
     if (!Object.keys(groupInfoMap).length) {
@@ -1545,6 +1614,23 @@
         }
       });
     }
+
+    // Also merge zStorage data if API returned fewer currentMems than totalMember
+    rawZStorageGroups.forEach(function (rawGroup) {
+      var key = normalizeConversationId(rawGroup && (rawGroup.userId || rawGroup.groupId || rawGroup.id), true);
+      if (!key || !groupInfoMap[key]) return;
+      var apiGroup = groupInfoMap[key];
+      var apiMems = (apiGroup.currentMems || []).length;
+      var rawMems = (rawGroup.currentMems || []).length;
+      if (rawMems > apiMems) {
+        console.log('[ZaloMain] zStorage has more currentMems for', key, ':', rawMems, 'vs API:', apiMems);
+        apiGroup.currentMems = rawGroup.currentMems;
+      }
+      // Also supplement memVerList
+      if ((rawGroup.memVerList || []).length > (apiGroup.memVerList || []).length) {
+        apiGroup.memVerList = rawGroup.memVerList;
+      }
+    });
 
     console.log('[ZaloMain] final groupInfoMap keys:', Object.keys(groupInfoMap).join(', '));
     var membersByGroup = {};
