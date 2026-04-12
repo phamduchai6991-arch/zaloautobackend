@@ -1120,6 +1120,493 @@
     }
   }
 
+  function chunkArray(items, size) {
+    var result = [];
+    for (var index = 0; index < items.length; index += size) {
+      result.push(items.slice(index, index + size));
+    }
+    return result;
+  }
+
+  function normalizeMemberVersionKey(value) {
+    var text = String(value || '').trim();
+    if (!text) return '';
+    if (text.indexOf('_') !== -1) return text;
+    return text + '_0';
+  }
+
+  function extractGroupMemberIds(group) {
+    var ids = [];
+    var seen = new Set();
+
+    function pushId(value) {
+      var text = String(value || '').trim();
+      if (!text || seen.has(text)) return;
+      seen.add(text);
+      ids.push(text);
+    }
+
+    if (Array.isArray(group && group.memberIds)) {
+      group.memberIds.forEach(pushId);
+    }
+
+    if (Array.isArray(group && group.currentMems)) {
+      group.currentMems.forEach(function (item) {
+        if (item && typeof item === 'object') {
+          pushId(item.id || item.userId || item.uid);
+        } else {
+          pushId(item);
+        }
+      });
+    }
+
+    if (Array.isArray(group && group.updateMems)) {
+      group.updateMems.forEach(function (item) {
+        if (item && typeof item === 'object') {
+          pushId(item.id || item.userId || item.uid);
+        } else {
+          pushId(item);
+        }
+      });
+    }
+
+    if (Array.isArray(group && group.memVerList)) {
+      group.memVerList.forEach(pushId);
+    }
+
+    return ids;
+  }
+
+  function indexProfileByKey(target, source) {
+    Object.entries(source || {}).forEach(function (entry) {
+      var key = entry[0];
+      var profile = entry[1];
+      target[key] = profile;
+      var plain = String(key || '').replace(/_\d+$/, '');
+      if (plain && plain !== key) {
+        target[plain] = profile;
+      } else if (plain) {
+        target[plain + '_0'] = profile;
+      }
+    });
+  }
+
+  function buildFriendIdentifierSet(friends) {
+    var identifiers = new Set();
+    toArray(friends).forEach(function (friend) {
+      [friend && friend.userId, friend && friend.username, friend && friend.globalId].forEach(function (value) {
+        var text = String(value || '').trim();
+        if (text) identifiers.add(text);
+      });
+    });
+    return identifiers;
+  }
+
+  function normalizeLookupQuery(value) {
+    return String(value || '').trim();
+  }
+
+  function normalizePhoneLookupValue(value) {
+    var text = normalizeLookupQuery(value).replace(/[\s().-]/g, '');
+    if (!text) return '';
+    if (text.charAt(0) === '+') {
+      text = text.slice(1);
+    }
+    if (text.charAt(0) === '0') {
+      return '84' + text.slice(1);
+    }
+    return text;
+  }
+
+  function looksLikePhoneLookup(value) {
+    return /^\+?\d{8,15}$/.test(normalizeLookupQuery(value).replace(/[\s().-]/g, ''));
+  }
+
+  function addLookupKey(target, key, value) {
+    var text = normalizeLookupQuery(key);
+    if (!text || target.has(text)) return;
+    target.set(text, value);
+  }
+
+  function buildFriendLookupMap(friends) {
+    var lookup = new Map();
+    toArray(friends).forEach(function (friend) {
+      var normalized = normalizeFriend(friend) || friend;
+      if (!normalized) return;
+      addLookupKey(lookup, normalized.userId, normalized);
+      addLookupKey(lookup, normalized.username, normalized);
+      addLookupKey(lookup, normalized.globalId, normalized);
+      addLookupKey(lookup, normalized.phoneNumber, normalized);
+      addLookupKey(lookup, normalizePhoneLookupValue(normalized.phoneNumber), normalized);
+    });
+    return lookup;
+  }
+
+  function buildResolvedUserRecord(query, payload) {
+    return {
+      query: query,
+      phone: query,
+      found: true,
+      uid: String(payload && (payload.uid || payload.userId || payload.id) || '').trim(),
+      displayName: String(payload && (payload.displayName || payload.display_name || payload.zaloName || payload.zalo_name) || '').trim(),
+      zaloName: String(payload && (payload.zaloName || payload.zalo_name || payload.displayName || payload.display_name) || '').trim(),
+      avatar: String(payload && payload.avatar || '').trim(),
+      gender: payload && payload.gender || '',
+      status: String(payload && payload.status || '').trim(),
+      globalId: String(payload && payload.globalId || '').trim(),
+      isFr: Number(payload && payload.isFr) === 1,
+    };
+  }
+
+  async function lookupUserProfileById(query) {
+    var text = normalizeLookupQuery(query);
+    if (!text) return null;
+
+    var userInfoResponse = await withTimeout(
+      callFirstAvailableMethod(['getUserInfo'], [[text, normalizeMemberVersionKey(text)]]),
+      12000,
+      { changed_profiles: {} }
+    );
+    var userInfoMap = {};
+    indexProfileByKey(userInfoMap, userInfoResponse && userInfoResponse.changed_profiles);
+    var profile = userInfoMap[text] || userInfoMap[normalizeMemberVersionKey(text)] || null;
+    if (!profile) return null;
+
+    return buildResolvedUserRecord(query, {
+      uid: profile.userId || profile.id || text,
+      displayName: profile.displayName || profile.zaloName || '',
+      zaloName: profile.zaloName || profile.displayName || '',
+      avatar: profile.avatar || '',
+      gender: profile.gender || '',
+      status: profile.status || '',
+      globalId: profile.globalId || '',
+      isFr: profile.isFr,
+    });
+  }
+
+  async function findUserByPhoneQuery(query) {
+    var phoneQuery = normalizePhoneLookupValue(query);
+    if (!phoneQuery || !looksLikePhoneLookup(query)) return null;
+
+    var result = await withTimeout(callFirstAvailableMethod(['findUser'], [phoneQuery]), 12000, null);
+    if (!result || !result.uid) return null;
+
+    return buildResolvedUserRecord(query, {
+      uid: result.uid,
+      displayName: result.display_name || result.zalo_name || '',
+      zaloName: result.zalo_name || result.display_name || '',
+      avatar: result.avatar || '',
+      gender: result.gender || '',
+      status: result.status || '',
+      globalId: result.globalId || '',
+      isFr: result.isFr,
+    });
+  }
+
+  async function resolveUserTargets(args) {
+    if (!initWebpackApi()) {
+      throw new Error('Webpack API chưa sẵn sàng. Trang Zalo có thể chưa tải xong.');
+    }
+
+    var queries = Array.isArray(args && args.queries)
+      ? args.queries.map(normalizeLookupQuery).filter(Boolean).slice(0, 100)
+      : [];
+
+    if (!queries.length) {
+      return { results: [] };
+    }
+
+    var zs = window.$$afmc && window.$$afmc.zStorage;
+    var me = null;
+    try {
+      me = zs && typeof zs.getMe === 'function' ? await withTimeout(zs.getMe(), 1500, null) : null;
+    } catch (_) {
+      me = null;
+    }
+
+    var accountUserId = String((args && args.accountUserId) || (me && me.userId) || buildSessionSnapshot().userId || '').trim();
+
+    var friends = [];
+    try {
+      friends = zs && typeof zs.getFriends === 'function' ? await withTimeout(zs.getFriends(), 1500, []) : [];
+    } catch (_) {
+      friends = [];
+    }
+
+    var friendLookup = buildFriendLookupMap(friends);
+    var results = [];
+
+    for (var index = 0; index < queries.length; index += 1) {
+      var query = queries[index];
+      var friendMatch = friendLookup.get(query) || friendLookup.get(normalizePhoneLookupValue(query)) || null;
+
+      if (friendMatch) {
+        var friendRecord = buildResolvedUserRecord(query, {
+          uid: friendMatch.userId || friendMatch.id,
+          displayName: friendMatch.displayName || friendMatch.zaloName || '',
+          zaloName: friendMatch.zaloName || friendMatch.displayName || '',
+          avatar: friendMatch.avatar || '',
+          gender: friendMatch.gender || '',
+          status: friendMatch.status || '',
+          globalId: friendMatch.globalId || '',
+          isFr: friendMatch.isFr,
+        });
+
+        if (!friendRecord.uid || friendRecord.uid === accountUserId) {
+          results.push({ query: query, phone: query, found: false, error: 'Đây là tài khoản hiện tại.' });
+        } else {
+          results.push(friendRecord);
+        }
+        continue;
+      }
+
+      var directProfile = null;
+      try {
+        directProfile = await lookupUserProfileById(query);
+      } catch (_) {
+        directProfile = null;
+      }
+
+      if (directProfile && directProfile.uid) {
+        if (directProfile.uid === accountUserId) {
+          results.push({ query: query, phone: query, found: false, error: 'Đây là tài khoản hiện tại.' });
+        } else {
+          results.push(directProfile);
+        }
+        continue;
+      }
+
+      var phoneProfile = null;
+      try {
+        phoneProfile = await findUserByPhoneQuery(query);
+      } catch (error) {
+        results.push({
+          query: query,
+          phone: query,
+          found: false,
+          error: error instanceof Error ? error.message : 'Lỗi khi tra cứu tài khoản.',
+        });
+        continue;
+      }
+
+      if (phoneProfile && phoneProfile.uid) {
+        if (phoneProfile.uid === accountUserId) {
+          results.push({ query: query, phone: query, found: false, error: 'Đây là tài khoản hiện tại.' });
+        } else {
+          results.push(phoneProfile);
+        }
+        continue;
+      }
+
+      results.push({ query: query, phone: query, found: false, error: 'Không tìm thấy tài khoản Zalo.' });
+    }
+
+    return { results: results };
+  }
+
+  function extractGroupInfoMap(result, fallbackGroups) {
+    if (result && result.gridInfoMap && typeof result.gridInfoMap === 'object') {
+      return result.gridInfoMap;
+    }
+
+    if (result && result.data && result.data.gridInfoMap && typeof result.data.gridInfoMap === 'object') {
+      return result.data.gridInfoMap;
+    }
+
+    var map = {};
+    toArray(result).forEach(function (group) {
+      var key = normalizeConversationId(group && (group.groupId || group.userId || group.id), true);
+      if (key) map[key] = group;
+    });
+
+    if (Object.keys(map).length > 0) {
+      return map;
+    }
+
+    toArray(fallbackGroups).forEach(function (group) {
+      var key = normalizeConversationId(group && (group.userId || group.groupId || group.id), true);
+      if (key) map[key] = group;
+    });
+    return map;
+  }
+
+  async function callFirstAvailableMethod(methodNames, args) {
+    var owners = [_httpModule, _businessModule].filter(Boolean);
+    var lastError = null;
+
+    for (var ownerIndex = 0; ownerIndex < owners.length; ownerIndex += 1) {
+      var owner = owners[ownerIndex];
+      for (var methodIndex = 0; methodIndex < methodNames.length; methodIndex += 1) {
+        var methodName = methodNames[methodIndex];
+        if (typeof owner[methodName] !== 'function') continue;
+        try {
+          return await owner[methodName].apply(owner, args || []);
+        } catch (error) {
+          lastError = error;
+        }
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+
+    throw new Error('Không tìm thấy phương thức Zalo phù hợp: ' + methodNames.join(', '));
+  }
+
+  async function resolveGroupMembers(args) {
+    if (!initWebpackApi()) {
+      throw new Error('Webpack API chưa sẵn sàng. Trang Zalo có thể chưa tải xong.');
+    }
+
+    var groups = Array.isArray(args && args.groups) ? args.groups : [];
+    var groupIds = groups
+      .map(function (group) {
+        if (group && typeof group === 'object') {
+          return normalizeConversationId(group.groupId || group.zid || group.userId || group.id, true);
+        }
+        return normalizeConversationId(group, true);
+      })
+      .filter(Boolean);
+
+    if (!groupIds.length) {
+      return { membersByGroup: {} };
+    }
+
+    var zs = window.$$afmc && window.$$afmc.zStorage;
+    var me = null;
+    try {
+      me = zs && typeof zs.getMe === 'function' ? await withTimeout(zs.getMe(), 1500, null) : null;
+    } catch (_) {
+      me = null;
+    }
+
+    var friends = [];
+    try {
+      friends = zs && typeof zs.getFriends === 'function' ? await withTimeout(zs.getFriends(), 1500, []) : [];
+    } catch (_) {
+      friends = [];
+    }
+
+    var fallbackGroups = [];
+    try {
+      fallbackGroups = zs ? await collectGroups(zs) : [];
+    } catch (_) {
+      fallbackGroups = [];
+    }
+
+    var accountUserId = String((args && args.accountUserId) || (me && me.userId) || buildSessionSnapshot().userId || '').trim();
+    var existingFriendIds = buildFriendIdentifierSet(friends);
+    var groupInfoResponse = null;
+
+    try {
+      groupInfoResponse = await withTimeout(callFirstAvailableMethod(['getGroupInfo', 'getGroupInfos'], [groupIds, 1, 500]), 15000, null);
+    } catch (_) {
+      groupInfoResponse = null;
+    }
+
+    var groupInfoMap = extractGroupInfoMap(groupInfoResponse, fallbackGroups);
+    var membersByGroup = {};
+
+    for (var groupIndex = 0; groupIndex < groupIds.length; groupIndex += 1) {
+      var groupId = groupIds[groupIndex];
+      var group = groupInfoMap[groupId] || groupInfoMap['g' + groupId] || null;
+      if (!group) {
+        membersByGroup[groupId] = [];
+        continue;
+      }
+
+      var adminIds = Array.isArray(group.adminIds) ? group.adminIds : (Array.isArray(group.admin_ids) ? group.admin_ids : []);
+      var adminIdSet = new Set(adminIds.map(function (id) { return String(id || '').trim(); }).filter(Boolean));
+      var creatorId = String(group.creatorId || group.ownerId || group.creator || '').trim();
+      var memberVersionKeys = extractGroupMemberIds(group).map(normalizeMemberVersionKey).filter(Boolean);
+
+      if (!memberVersionKeys.length) {
+        membersByGroup[groupId] = [];
+        continue;
+      }
+
+      var currentMemsMap = {};
+      if (Array.isArray(group.currentMems)) {
+        group.currentMems.forEach(function (mem) {
+          var id = String((mem && (mem.id || mem.userId || mem.uid)) || '').trim();
+          if (!id) return;
+          currentMemsMap[id] = mem;
+          currentMemsMap[id + '_0'] = mem;
+        });
+      }
+
+      var groupProfileMap = {};
+      var userInfoMap = {};
+      var profileChunks = chunkArray(memberVersionKeys, 200);
+
+      for (var chunkIndex = 0; chunkIndex < profileChunks.length; chunkIndex += 1) {
+        var ids = profileChunks[chunkIndex];
+        if (!ids.length) continue;
+
+        var groupMembersResponse = null;
+        try {
+          groupMembersResponse = await withTimeout(callFirstAvailableMethod(['getGroupMembersInfo'], [ids]), 15000, { profiles: {} });
+        } catch (_) {
+          groupMembersResponse = { profiles: {} };
+        }
+
+        var userInfoResponse = null;
+        try {
+          userInfoResponse = await withTimeout(callFirstAvailableMethod(['getUserInfo'], [ids]), 15000, { changed_profiles: {} });
+        } catch (_) {
+          userInfoResponse = { changed_profiles: {} };
+        }
+
+        indexProfileByKey(groupProfileMap, groupMembersResponse && groupMembersResponse.profiles);
+        indexProfileByKey(userInfoMap, userInfoResponse && userInfoResponse.changed_profiles);
+      }
+
+      membersByGroup[groupId] = memberVersionKeys.map(function (memberKey, index) {
+        var plainKey = String(memberKey || '').replace(/_\d+$/, '');
+        var uiProfile = userInfoMap[memberKey] || userInfoMap[plainKey] || {};
+        var gmProfile = groupProfileMap[memberKey] || groupProfileMap[plainKey] || {};
+        var actualUserId = String(uiProfile.userId || uiProfile.id || gmProfile.userId || gmProfile.id || plainKey).trim();
+
+        if (!actualUserId || actualUserId === accountUserId) return null;
+
+        var currentMem = currentMemsMap[actualUserId] || currentMemsMap[memberKey] || currentMemsMap[plainKey] || {};
+        var displayName = uiProfile.displayName || uiProfile.zaloName
+          || gmProfile.displayName || gmProfile.zaloName
+          || currentMem.dName || currentMem.displayName || currentMem.zaloName || '';
+        var avatar = uiProfile.avatar || gmProfile.avatar || currentMem.avatar || currentMem.avatar_25 || '';
+
+        var role = 'Thành viên';
+        if (creatorId && creatorId === actualUserId) {
+          role = 'Trưởng nhóm';
+        } else if (adminIdSet.has(actualUserId) || Number(gmProfile.isAdmin) === 1 || Number(gmProfile.is_admin) === 1) {
+          role = 'Phó nhóm';
+        }
+
+        var isFriend = Number(uiProfile.isFr) === 1
+          || existingFriendIds.has(actualUserId)
+          || existingFriendIds.has(String(uiProfile.username || '').trim())
+          || existingFriendIds.has(String(uiProfile.globalId || '').trim());
+
+        return {
+          key: groupId + '_' + actualUserId,
+          zid: actualUserId,
+          name: displayName || 'Thành viên',
+          avatar: avatar,
+          phone: '—',
+          role: role,
+          relationLabel: isFriend ? 'Bạn bè' : 'Chưa kết bạn',
+          isFriend: isFriend,
+          sourceTab: group.name || group.displayName || 'Nhóm',
+          groupId: groupId,
+          rowKey: String(actualUserId || index),
+        };
+      }).filter(Boolean);
+    }
+
+    return { membersByGroup: membersByGroup };
+  }
+
   function executeApiCall(method, args) {
     if (!initWebpackApi()) {
       return Promise.reject(new Error('Webpack API chưa sẵn sàng. Trang Zalo có thể chưa tải xong.'));
@@ -1182,6 +1669,14 @@
 
       case 'getConversationPreview': {
         return getConversationPreview(args.toId);
+      }
+
+      case 'resolveGroupMembers': {
+        return resolveGroupMembers(args || {});
+      }
+
+      case 'resolveUserTargets': {
+        return resolveUserTargets(args || {});
       }
 
       case 'getConversationList': {
