@@ -1483,10 +1483,23 @@
 
     var friends = [];
     try {
-      friends = zs && typeof zs.getFriends === 'function' ? await withTimeout(zs.getFriends(), 1500, []) : [];
+      friends = zs && typeof zs.getFriends === 'function' ? await withTimeout(zs.getFriends(), 3000, []) : [];
     } catch (_) {
       friends = [];
     }
+    console.log('[ZaloMain] resolveGroupMembers: friends loaded:', friends.length);
+
+    // Build userId → friend profile map for name resolution
+    var friendProfileMap = {};
+    toArray(friends).forEach(function (friend) {
+      var normalized = normalizeFriend(friend) || friend;
+      if (!normalized) return;
+      var uid = String(normalized.userId || '').trim();
+      if (uid) {
+        friendProfileMap[uid] = normalized;
+        friendProfileMap[uid + '_0'] = normalized;
+      }
+    });
 
     var fallbackGroups = [];
     try {
@@ -1497,24 +1510,46 @@
 
     var accountUserId = String((args && args.accountUserId) || (me && me.userId) || buildSessionSnapshot().userId || '').trim();
     var existingFriendIds = buildFriendIdentifierSet(friends);
-    var groupInfoResponse = null;
 
+    // Try getGroupInfo API first, fall back to zStorage groups
+    var groupInfoResponse = null;
     try {
       groupInfoResponse = await withTimeout(callFirstAvailableMethod(['getGroupInfo', 'getGroupInfos'], [groupIds, 1, 500]), 15000, null);
-    } catch (_) {
+    } catch (e) {
+      console.warn('[ZaloMain] getGroupInfo failed:', e.message);
       groupInfoResponse = null;
     }
 
     var groupInfoMap = extractGroupInfoMap(groupInfoResponse, fallbackGroups);
+    console.log('[ZaloMain] groupInfoMap keys:', Object.keys(groupInfoMap).join(', '));
     var membersByGroup = {};
 
     for (var groupIndex = 0; groupIndex < groupIds.length; groupIndex += 1) {
       var groupId = groupIds[groupIndex];
       var group = groupInfoMap[groupId] || groupInfoMap['g' + groupId] || null;
+
+      // If API didn't return the group, try matching from zStorage fallback groups
       if (!group) {
+        for (var fbIdx = 0; fbIdx < fallbackGroups.length; fbIdx += 1) {
+          var fbGroup = fallbackGroups[fbIdx];
+          var fbId = normalizeConversationId(fbGroup && (fbGroup.userId || fbGroup.groupId || fbGroup.id), true);
+          if (fbId === groupId) {
+            group = fbGroup;
+            break;
+          }
+        }
+      }
+
+      if (!group) {
+        console.warn('[ZaloMain] group not found:', groupId);
         membersByGroup[groupId] = [];
         continue;
       }
+
+      console.log('[ZaloMain] group found:', groupId, 'name:', group.name || group.displayName,
+        'memberIds:', (group.memberIds || []).length,
+        'currentMems:', (group.currentMems || []).length,
+        'memVerList:', (group.memVerList || []).length);
 
       var adminIds = Array.isArray(group.adminIds) ? group.adminIds : (Array.isArray(group.admin_ids) ? group.admin_ids : []);
       var adminIdSet = new Set(adminIds.map(function (id) { return String(id || '').trim(); }).filter(Boolean));
@@ -1522,10 +1557,14 @@
       var memberVersionKeys = extractGroupMemberIds(group).map(normalizeMemberVersionKey).filter(Boolean);
 
       if (!memberVersionKeys.length) {
+        console.warn('[ZaloMain] no member IDs extracted for group:', groupId);
         membersByGroup[groupId] = [];
         continue;
       }
 
+      console.log('[ZaloMain] memberVersionKeys:', memberVersionKeys.length, 'sample:', memberVersionKeys.slice(0, 3).join(', '));
+
+      // Build currentMems lookup (includes dName from getGroupInfo response)
       var currentMemsMap = {};
       if (Array.isArray(group.currentMems)) {
         group.currentMems.forEach(function (mem) {
@@ -1536,6 +1575,7 @@
         });
       }
 
+      // Fetch enriched profiles via API calls (best-effort)
       var groupProfileMap = {};
       var userInfoMap = {};
       var profileChunks = chunkArray(memberVersionKeys, 200);
@@ -1547,14 +1587,18 @@
         var groupMembersResponse = null;
         try {
           groupMembersResponse = await withTimeout(callFirstAvailableMethod(['getGroupMembersInfo'], [ids]), 15000, { profiles: {} });
-        } catch (_) {
+          console.log('[ZaloMain] getGroupMembersInfo OK, profiles:', Object.keys((groupMembersResponse && groupMembersResponse.profiles) || {}).length);
+        } catch (e) {
+          console.warn('[ZaloMain] getGroupMembersInfo failed:', e.message);
           groupMembersResponse = { profiles: {} };
         }
 
         var userInfoResponse = null;
         try {
           userInfoResponse = await withTimeout(callFirstAvailableMethod(['getUserInfo'], [ids]), 15000, { changed_profiles: {} });
-        } catch (_) {
+          console.log('[ZaloMain] getUserInfo OK, profiles:', Object.keys((userInfoResponse && userInfoResponse.changed_profiles) || {}).length);
+        } catch (e) {
+          console.warn('[ZaloMain] getUserInfo failed:', e.message);
           userInfoResponse = { changed_profiles: {} };
         }
 
@@ -1564,17 +1608,41 @@
 
       membersByGroup[groupId] = memberVersionKeys.map(function (memberKey, index) {
         var plainKey = String(memberKey || '').replace(/_\d+$/, '');
+        var friendProfile = friendProfileMap[plainKey] || friendProfileMap[memberKey] || null;
         var uiProfile = userInfoMap[memberKey] || userInfoMap[plainKey] || {};
         var gmProfile = groupProfileMap[memberKey] || groupProfileMap[plainKey] || {};
-        var actualUserId = String(uiProfile.userId || uiProfile.id || gmProfile.userId || gmProfile.id || plainKey).trim();
+        var currentMem = currentMemsMap[plainKey] || currentMemsMap[memberKey] || {};
+        var actualUserId = String(
+          friendProfile && friendProfile.userId
+          || uiProfile.userId || uiProfile.id
+          || gmProfile.userId || gmProfile.id
+          || plainKey
+        ).trim();
 
         if (!actualUserId || actualUserId === accountUserId) return null;
 
-        var currentMem = currentMemsMap[actualUserId] || currentMemsMap[memberKey] || currentMemsMap[plainKey] || {};
-        var displayName = uiProfile.displayName || uiProfile.zaloName
-          || gmProfile.displayName || gmProfile.zaloName
-          || currentMem.dName || currentMem.displayName || currentMem.zaloName || '';
-        var avatar = uiProfile.avatar || gmProfile.avatar || currentMem.avatar || currentMem.avatar_25 || '';
+        // Name resolution priority: friend list → getUserInfo → getGroupMembersInfo → currentMems
+        var displayName = '';
+        if (friendProfile) {
+          displayName = friendProfile.displayName || friendProfile.zaloName || '';
+        }
+        if (!displayName) {
+          displayName = uiProfile.displayName || uiProfile.zaloName || '';
+        }
+        if (!displayName) {
+          displayName = gmProfile.displayName || gmProfile.zaloName || '';
+        }
+        if (!displayName) {
+          displayName = currentMem.dName || currentMem.displayName || currentMem.zaloName || '';
+        }
+
+        var avatar = '';
+        if (friendProfile) {
+          avatar = friendProfile.avatar || '';
+        }
+        if (!avatar) {
+          avatar = uiProfile.avatar || gmProfile.avatar || currentMem.avatar || currentMem.avatar_25 || '';
+        }
 
         var role = 'Thành viên';
         if (creatorId && creatorId === actualUserId) {
@@ -1583,7 +1651,8 @@
           role = 'Phó nhóm';
         }
 
-        var isFriend = Number(uiProfile.isFr) === 1
+        var isFriend = Boolean(friendProfile)
+          || Number(uiProfile.isFr) === 1
           || existingFriendIds.has(actualUserId)
           || existingFriendIds.has(String(uiProfile.username || '').trim())
           || existingFriendIds.has(String(uiProfile.globalId || '').trim());
@@ -1602,6 +1671,9 @@
           rowKey: String(actualUserId || index),
         };
       }).filter(Boolean);
+
+      console.log('[ZaloMain] group', groupId, 'resolved:', membersByGroup[groupId].length, 'members,',
+        membersByGroup[groupId].filter(function (m) { return m.name !== 'Thành viên'; }).length, 'with names');
     }
 
     return { membersByGroup: membersByGroup };
