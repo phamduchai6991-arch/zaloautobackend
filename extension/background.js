@@ -958,6 +958,7 @@ async function focusMessageActionTab(tabId) {
 async function ensureMessageActionTab(account, options = {}) {
   const interactive = Boolean(options.interactive);
   const forceReset = Boolean(options.forceReset);
+  const allowCreateTab = options.allowCreateTab !== false;
 
   if (forceReset) {
     await closeManagedMessageActionWindow();
@@ -1002,6 +1003,10 @@ async function ensureMessageActionTab(account, options = {}) {
       }
       return matchingTabId;
     }
+  }
+
+  if (!allowCreateTab) {
+    throw new Error('Không tìm thấy tab Zalo đang mở cho tài khoản đã chọn. Hãy mở sẵn chat.zalo.me đúng tài khoản rồi thử lại.');
   }
 
   // 3. Fallback: create a dedicated action window.
@@ -1111,6 +1116,7 @@ async function getZaloCommonData(payload) {
 async function forwardZaloApiRequest(payload) {
   const account = payload?.account;
   const request = payload?.request;
+  const allowCreateTab = payload?.options?.allowCreateTab !== false;
 
   if (!account) {
     return { ok: false, error: 'Không có thông tin tài khoản để gửi request Zalo.' };
@@ -1122,7 +1128,7 @@ async function forwardZaloApiRequest(payload) {
 
   await ensureAccountReady(account, 'Zalo API request');
 
-  const tabId = await ensureMessageActionTab(account);
+  const tabId = await ensureMessageActionTab(account, { allowCreateTab });
   const data = await sendApiRequestToTab(tabId, request);
   return { ok: true, data };
 }
