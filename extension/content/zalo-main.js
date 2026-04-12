@@ -1501,37 +1501,62 @@
       }
     });
 
-    var fallbackGroups = [];
+    // Load RAW groups from zStorage (not normalized, to preserve currentMems/memVerList)
+    var rawZStorageGroups = [];
     try {
-      fallbackGroups = zs ? await collectGroups(zs) : [];
+      rawZStorageGroups = zs && typeof zs.getGroups === 'function'
+        ? toArray(await withTimeout(zs.getGroups(), 3000, []))
+        : [];
     } catch (_) {
-      fallbackGroups = [];
+      rawZStorageGroups = [];
     }
+    console.log('[ZaloMain] rawZStorageGroups:', rawZStorageGroups.length);
 
     var accountUserId = String((args && args.accountUserId) || (me && me.userId) || buildSessionSnapshot().userId || '').trim();
     var existingFriendIds = buildFriendIdentifierSet(friends);
 
-    // Try getGroupInfo API first, fall back to zStorage groups
+    // Step 1: Try getGroupInfo API (the most reliable source for member data)
     var groupInfoResponse = null;
     try {
       groupInfoResponse = await withTimeout(callFirstAvailableMethod(['getGroupInfo', 'getGroupInfos'], [groupIds, 1, 500]), 15000, null);
+      console.log('[ZaloMain] getGroupInfo response type:', typeof groupInfoResponse,
+        'gridInfoMap:', groupInfoResponse && groupInfoResponse.gridInfoMap ? Object.keys(groupInfoResponse.gridInfoMap).join(',') : 'null',
+        'data.gridInfoMap:', groupInfoResponse && groupInfoResponse.data && groupInfoResponse.data.gridInfoMap ? Object.keys(groupInfoResponse.data.gridInfoMap).join(',') : 'null');
     } catch (e) {
       console.warn('[ZaloMain] getGroupInfo failed:', e.message);
       groupInfoResponse = null;
     }
 
-    var groupInfoMap = extractGroupInfoMap(groupInfoResponse, fallbackGroups);
-    console.log('[ZaloMain] groupInfoMap keys:', Object.keys(groupInfoMap).join(', '));
+    // Build group info map from API response
+    var groupInfoMap = {};
+    if (groupInfoResponse && groupInfoResponse.gridInfoMap && typeof groupInfoResponse.gridInfoMap === 'object') {
+      groupInfoMap = groupInfoResponse.gridInfoMap;
+    } else if (groupInfoResponse && groupInfoResponse.data && groupInfoResponse.data.gridInfoMap && typeof groupInfoResponse.data.gridInfoMap === 'object') {
+      groupInfoMap = groupInfoResponse.data.gridInfoMap;
+    }
+
+    // Fallback: match from raw zStorage groups (preserves currentMems, memberIds, etc.)
+    if (!Object.keys(groupInfoMap).length) {
+      console.log('[ZaloMain] API groupInfoMap empty, trying zStorage raw groups');
+      rawZStorageGroups.forEach(function (group) {
+        var key = normalizeConversationId(group && (group.userId || group.groupId || group.id), true);
+        if (key && !groupInfoMap[key]) {
+          groupInfoMap[key] = group;
+        }
+      });
+    }
+
+    console.log('[ZaloMain] final groupInfoMap keys:', Object.keys(groupInfoMap).join(', '));
     var membersByGroup = {};
 
     for (var groupIndex = 0; groupIndex < groupIds.length; groupIndex += 1) {
       var groupId = groupIds[groupIndex];
       var group = groupInfoMap[groupId] || groupInfoMap['g' + groupId] || null;
 
-      // If API didn't return the group, try matching from zStorage fallback groups
+      // Fallback: search raw zStorage groups by ID
       if (!group) {
-        for (var fbIdx = 0; fbIdx < fallbackGroups.length; fbIdx += 1) {
-          var fbGroup = fallbackGroups[fbIdx];
+        for (var fbIdx = 0; fbIdx < rawZStorageGroups.length; fbIdx += 1) {
+          var fbGroup = rawZStorageGroups[fbIdx];
           var fbId = normalizeConversationId(fbGroup && (fbGroup.userId || fbGroup.groupId || fbGroup.id), true);
           if (fbId === groupId) {
             group = fbGroup;
@@ -1546,10 +1571,19 @@
         continue;
       }
 
-      console.log('[ZaloMain] group found:', groupId, 'name:', group.name || group.displayName,
+      // Log raw group structure for debugging
+      console.log('[ZaloMain] group found:', groupId,
+        'name:', group.name || group.displayName,
         'memberIds:', (group.memberIds || []).length,
         'currentMems:', (group.currentMems || []).length,
-        'memVerList:', (group.memVerList || []).length);
+        'memVerList:', (group.memVerList || []).length,
+        'updateMems:', (group.updateMems || []).length,
+        'totalMember:', group.totalMember);
+
+      // Log a sample currentMem to see its structure
+      if (Array.isArray(group.currentMems) && group.currentMems.length > 0) {
+        console.log('[ZaloMain] sample currentMem[0]:', JSON.stringify(group.currentMems[0]).slice(0, 300));
+      }
 
       var adminIds = Array.isArray(group.adminIds) ? group.adminIds : (Array.isArray(group.admin_ids) ? group.admin_ids : []);
       var adminIdSet = new Set(adminIds.map(function (id) { return String(id || '').trim(); }).filter(Boolean));
@@ -1562,20 +1596,23 @@
         continue;
       }
 
-      console.log('[ZaloMain] memberVersionKeys:', memberVersionKeys.length, 'sample:', memberVersionKeys.slice(0, 3).join(', '));
+      console.log('[ZaloMain] memberVersionKeys:', memberVersionKeys.length,
+        'sample:', memberVersionKeys.slice(0, 5).join(', '));
 
-      // Build currentMems lookup (includes dName from getGroupInfo response)
+      // Build currentMems lookup (dName from getGroupInfo is the most reliable name source)
       var currentMemsMap = {};
       if (Array.isArray(group.currentMems)) {
         group.currentMems.forEach(function (mem) {
-          var id = String((mem && (mem.id || mem.userId || mem.uid)) || '').trim();
+          if (!mem || typeof mem !== 'object') return;
+          var id = String(mem.id || mem.userId || mem.uid || '').trim();
           if (!id) return;
           currentMemsMap[id] = mem;
           currentMemsMap[id + '_0'] = mem;
         });
       }
+      console.log('[ZaloMain] currentMemsMap entries:', Object.keys(currentMemsMap).length);
 
-      // Fetch enriched profiles via API calls (best-effort)
+      // Fetch enriched profiles via API calls (best-effort, may fail)
       var groupProfileMap = {};
       var userInfoMap = {};
       var profileChunks = chunkArray(memberVersionKeys, 200);
@@ -1584,27 +1621,49 @@
         var ids = profileChunks[chunkIndex];
         if (!ids.length) continue;
 
+        // Try getGroupMembersInfo
         var groupMembersResponse = null;
         try {
-          groupMembersResponse = await withTimeout(callFirstAvailableMethod(['getGroupMembersInfo'], [ids]), 15000, { profiles: {} });
-          console.log('[ZaloMain] getGroupMembersInfo OK, profiles:', Object.keys((groupMembersResponse && groupMembersResponse.profiles) || {}).length);
+          groupMembersResponse = await withTimeout(callFirstAvailableMethod(['getGroupMembersInfo'], [ids]), 12000, null);
+          if (groupMembersResponse) {
+            var gmProfiles = groupMembersResponse.profiles || {};
+            console.log('[ZaloMain] getGroupMembersInfo OK, profiles:', Object.keys(gmProfiles).length);
+            if (Object.keys(gmProfiles).length > 0) {
+              console.log('[ZaloMain] sample gmProfile:', JSON.stringify(Object.values(gmProfiles)[0]).slice(0, 300));
+            }
+            indexProfileByKey(groupProfileMap, gmProfiles);
+          } else {
+            console.log('[ZaloMain] getGroupMembersInfo returned null');
+          }
         } catch (e) {
           console.warn('[ZaloMain] getGroupMembersInfo failed:', e.message);
-          groupMembersResponse = { profiles: {} };
         }
 
+        // Try getUserInfo
         var userInfoResponse = null;
         try {
-          userInfoResponse = await withTimeout(callFirstAvailableMethod(['getUserInfo'], [ids]), 15000, { changed_profiles: {} });
-          console.log('[ZaloMain] getUserInfo OK, profiles:', Object.keys((userInfoResponse && userInfoResponse.changed_profiles) || {}).length);
+          userInfoResponse = await withTimeout(callFirstAvailableMethod(['getUserInfo'], [ids]), 12000, null);
+          if (userInfoResponse) {
+            var uiProfiles = userInfoResponse.changed_profiles || {};
+            console.log('[ZaloMain] getUserInfo OK, profiles:', Object.keys(uiProfiles).length);
+            if (Object.keys(uiProfiles).length > 0) {
+              console.log('[ZaloMain] sample uiProfile:', JSON.stringify(Object.values(uiProfiles)[0]).slice(0, 300));
+            }
+            indexProfileByKey(userInfoMap, uiProfiles);
+          } else {
+            console.log('[ZaloMain] getUserInfo returned null');
+          }
         } catch (e) {
           console.warn('[ZaloMain] getUserInfo failed:', e.message);
-          userInfoResponse = { changed_profiles: {} };
         }
-
-        indexProfileByKey(groupProfileMap, groupMembersResponse && groupMembersResponse.profiles);
-        indexProfileByKey(userInfoMap, userInfoResponse && userInfoResponse.changed_profiles);
       }
+
+      console.log('[ZaloMain] enrichment results — groupProfileMap:', Object.keys(groupProfileMap).length,
+        'userInfoMap:', Object.keys(userInfoMap).length,
+        'friendProfileMap matches:', memberVersionKeys.filter(function (k) {
+          var plain = k.replace(/_\d+$/, '');
+          return !!friendProfileMap[plain];
+        }).length);
 
       membersByGroup[groupId] = memberVersionKeys.map(function (memberKey, index) {
         var plainKey = String(memberKey || '').replace(/_\d+$/, '');
@@ -1621,7 +1680,7 @@
 
         if (!actualUserId || actualUserId === accountUserId) return null;
 
-        // Name resolution priority: friend list → getUserInfo → getGroupMembersInfo → currentMems
+        // Name resolution: friend list → getUserInfo → getGroupMembersInfo → currentMems.dName
         var displayName = '';
         if (friendProfile) {
           displayName = friendProfile.displayName || friendProfile.zaloName || '';
@@ -1632,17 +1691,14 @@
         if (!displayName) {
           displayName = gmProfile.displayName || gmProfile.zaloName || '';
         }
-        if (!displayName) {
-          displayName = currentMem.dName || currentMem.displayName || currentMem.zaloName || '';
+        if (!displayName && currentMem) {
+          displayName = currentMem.dName || currentMem.displayName || currentMem.zaloName || currentMem.name || '';
         }
 
         var avatar = '';
-        if (friendProfile) {
-          avatar = friendProfile.avatar || '';
-        }
-        if (!avatar) {
-          avatar = uiProfile.avatar || gmProfile.avatar || currentMem.avatar || currentMem.avatar_25 || '';
-        }
+        if (friendProfile) avatar = friendProfile.avatar || '';
+        if (!avatar) avatar = uiProfile.avatar || gmProfile.avatar || '';
+        if (!avatar && currentMem) avatar = currentMem.avatar || currentMem.avatar_25 || '';
 
         var role = 'Thành viên';
         if (creatorId && creatorId === actualUserId) {
@@ -1673,7 +1729,8 @@
       }).filter(Boolean);
 
       console.log('[ZaloMain] group', groupId, 'resolved:', membersByGroup[groupId].length, 'members,',
-        membersByGroup[groupId].filter(function (m) { return m.name !== 'Thành viên'; }).length, 'with names');
+        membersByGroup[groupId].filter(function (m) { return m.name !== 'Thành viên'; }).length, 'with names,',
+        'names:', membersByGroup[groupId].map(function (m) { return m.name; }).join(', '));
     }
 
     return { membersByGroup: membersByGroup };
