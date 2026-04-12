@@ -921,11 +921,41 @@ async function waitForMatchingTabSession(tabId, account, maxAttempts = 8) {
   return false;
 }
 
+async function tryReinjectContentScripts(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content/zalo-main.js'],
+      world: 'MAIN',
+    });
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content/zalo-bridge.js'],
+    });
+    await delay(3000);
+  } catch (e) {
+    console.warn('[ZaloTool BG] Failed to reinject content scripts into tab', tabId, e.message);
+  }
+}
+
 async function findMatchingZaloTab(account) {
   const allTabs = await tabsQuery({ url: 'https://chat.zalo.me/*' });
+
+  // First pass: try tabs that already have content scripts.
   for (const tab of allTabs) {
     if (!tab?.id || !tab.url?.includes('chat.zalo.me')) continue;
 
+    const session = await getTabSessionSnapshot(tab.id);
+    if (sessionMatchesAccount(session, account)) {
+      return tab.id;
+    }
+  }
+
+  // Second pass: reinject content scripts into unresponsive Zalo tabs and retry.
+  for (const tab of allTabs) {
+    if (!tab?.id || !tab.url?.includes('chat.zalo.me')) continue;
+
+    await tryReinjectContentScripts(tab.id);
     const session = await getTabSessionSnapshot(tab.id);
     if (sessionMatchesAccount(session, account)) {
       return tab.id;
@@ -1113,10 +1143,18 @@ async function getZaloCommonData(payload) {
   return { ok: true, data };
 }
 
+const READ_ONLY_ZALO_METHODS = new Set([
+  'resolveGroupMembers',
+  'resolveUserTargets',
+  'getSessionSnapshot',
+  'checkApiReady',
+]);
+
 async function forwardZaloApiRequest(payload) {
   const account = payload?.account;
   const request = payload?.request;
-  const allowCreateTab = payload?.options?.allowCreateTab !== false;
+  const isReadOnly = READ_ONLY_ZALO_METHODS.has(request?.method);
+  const allowCreateTab = isReadOnly ? false : (payload?.options?.allowCreateTab !== false);
 
   if (!account) {
     return { ok: false, error: 'Không có thông tin tài khoản để gửi request Zalo.' };
