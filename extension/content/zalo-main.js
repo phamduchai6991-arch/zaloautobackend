@@ -1953,10 +1953,15 @@
         var ids = profileChunks[chunkIndex];
         if (!ids.length) continue;
 
-        // Try getGroupMembersInfo
+        // Normalize IDs to have _0 suffix for friend_pversion_map
+        var versionedIds = ids.map(function (id) {
+          return id.endsWith('_0') ? id : id + '_0';
+        });
+
+        // Try getGroupMembersInfo via webpack API
         var groupMembersResponse = null;
         try {
-          groupMembersResponse = await withTimeout(callFirstAvailableMethod(['getGroupMembersInfo'], [ids]), 12000, null);
+          groupMembersResponse = await withTimeout(callFirstAvailableMethod(['getGroupMembersInfo'], [versionedIds]), 12000, null);
           if (groupMembersResponse) {
             var gmProfiles = groupMembersResponse.profiles || {};
             console.log('[ZaloMain] getGroupMembersInfo OK, profiles:', Object.keys(gmProfiles).length);
@@ -1987,6 +1992,97 @@
           }
         } catch (e) {
           console.warn('[ZaloMain] getUserInfo failed:', e.message);
+        }
+
+        // Raw HTTP fallback for getGroupMembersInfo if we got few profiles
+        if (Object.keys(groupProfileMap).length < ids.length * 0.3 &&
+            _encoderModule && typeof _encoderModule.encodeAES === 'function') {
+          try {
+            var profileParams = JSON.stringify({ friend_pversion_map: versionedIds });
+            var encProfileParams = _encoderModule.encodeAES(profileParams);
+            if (encProfileParams) {
+              var profileDomains = [];
+              if (!profileDomains.length && _wr && _wr.c) {
+                var prCache = _wr.c;
+                var prKeys = Object.keys(prCache);
+                for (var pri = 0; pri < prKeys.length && !profileDomains.length; pri++) {
+                  try {
+                    var prmod = prCache[prKeys[pri]];
+                    var prexp = prmod && prmod.exports;
+                    if (!prexp) continue;
+                    var sm = prexp.zpwServiceMap || prexp.default && prexp.default.zpwServiceMap ||
+                             prexp.zpw_service_map_v3 || prexp.default && prexp.default.zpw_service_map_v3;
+                    if (sm && sm.profile && Array.isArray(sm.profile)) {
+                      profileDomains = sm.profile;
+                    }
+                  } catch (_) {}
+                }
+              }
+              if (!profileDomains.length) {
+                [window.localStorage, window.sessionStorage].forEach(function (storage) {
+                  if (!storage || profileDomains.length) return;
+                  for (var si = 0; si < storage.length; si++) {
+                    try {
+                      var sk = storage.key(si);
+                      var sv = storage.getItem(sk);
+                      if (sv && sv.indexOf('zpw_service_map') !== -1) {
+                        var parsed = JSON.parse(sv);
+                        var m2 = parsed.zpw_service_map_v3 || parsed;
+                        if (m2.profile && Array.isArray(m2.profile)) profileDomains = m2.profile;
+                      }
+                    } catch (_) {}
+                  }
+                });
+              }
+              if (!profileDomains.length) {
+                try {
+                  var pe = performance.getEntriesByType('resource');
+                  for (var pei = 0; pei < pe.length; pei++) {
+                    var pu = pe[pei].name || '';
+                    if (pu.indexOf('/api/social/') !== -1) {
+                      var dm = pu.match(/^(https?:\/\/[^/]+)/);
+                      if (dm) { profileDomains.push(dm[1]); break; }
+                    }
+                  }
+                } catch (_) {}
+              }
+
+              var pCommonQs = '';
+              try {
+                if (_httpModule && typeof _httpModule._getCommonParams === 'function') {
+                  pCommonQs = _httpModule._getCommonParams();
+                }
+              } catch (_) {}
+              if (!pCommonQs) pCommonQs = 'zpw_ver=645&zpw_type=30';
+
+              if (profileDomains.length) {
+                var profileUrl = profileDomains[0] + '/api/social/group/members?' + pCommonQs + '&params=' + encodeURIComponent(encProfileParams);
+                console.log('[ZaloMain] raw HTTP getGroupMembersInfo to:', profileUrl.substring(0, 80) + '...');
+
+                var profileResp = await withTimeout(
+                  fetch(profileUrl, { credentials: 'include' }).then(function (r) { return r.json(); }),
+                  15000, null
+                );
+
+                if (profileResp && profileResp.error_code === 0 && profileResp.data) {
+                  var decFn2 = _encoderModule.decodeAES_original || _encoderModule.decodeAES;
+                  var decStr2 = typeof decFn2 === 'function' ? decFn2(profileResp.data, 0) : null;
+                  if (decStr2) {
+                    var decJson2 = JSON.parse(decStr2);
+                    if (decJson2.data && decJson2.data.profiles) {
+                      console.log('[ZaloMain] raw HTTP getGroupMembersInfo got', Object.keys(decJson2.data.profiles).length, 'profiles');
+                      indexProfileByKey(groupProfileMap, decJson2.data.profiles);
+                    } else if (decJson2.profiles) {
+                      console.log('[ZaloMain] raw HTTP getGroupMembersInfo got', Object.keys(decJson2.profiles).length, 'profiles');
+                      indexProfileByKey(groupProfileMap, decJson2.profiles);
+                    }
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            console.warn('[ZaloMain] raw HTTP getGroupMembersInfo failed:', e.message);
+          }
         }
       }
 
