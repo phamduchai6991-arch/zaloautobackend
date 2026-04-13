@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AutoZalo Bridge",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "description": "AutoZalo.vn — Quản lý Zalo đa tài khoản",
   "incognito": "spanning",
   "permissions": [

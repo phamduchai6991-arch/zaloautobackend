@@ -343,7 +343,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'ZALOTOOL_CHECK': {
       const trusted = isTrustedWebAppSender(sender);
       console.log('[BG] ZALOTOOL_CHECK sender:', sender?.tab?.url, 'trusted:', trusted);
-      sendResponse({ active: trusted, version: '1.0.0' });
+      sendResponse({
+        active: trusted,
+        version: '1.0.0',
+        error: trusted ? '' : 'Origin hiện tại chưa được extension cho phép hoặc extension chưa có Site access cho trang này.',
+      });
       return false;
     }
 

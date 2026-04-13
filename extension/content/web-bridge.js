@@ -251,12 +251,23 @@
   }
 
   console.log('[WebBridge] Meta tag found, initializing on', location.href);
+  postToPage('ZALOTOOL_BRIDGE_BOOTSTRAP', {
+    ok: true,
+    phase: 'bridge_detected',
+    url: location.href,
+  });
   ensureRuntimePort();
 
   // Tell background this tab is a web-app tab
   safeSendRuntimeMessage({ type: 'WEB_BRIDGE_INIT' }, function (resp, error) {
     console.log('[WebBridge] WEB_BRIDGE_INIT response:', resp, 'error:', error);
     if (error || resp?.ok === false) {
+      postToPage('ZALOTOOL_BRIDGE_ERROR', {
+        ok: false,
+        code: error ? 'runtime_unavailable' : 'origin_not_allowed',
+        phase: 'init_failed',
+        error: error || resp?.error || 'Origin hiện tại chưa được extension cho phép.',
+      });
       return;
     }
 
@@ -273,6 +284,12 @@
     if (msg.type === 'ZALOTOOL_CHECK') {
       safeSendRuntimeMessage({ type: 'ZALOTOOL_CHECK' }, function (resp, error) {
         if (error || resp?.active !== true) {
+          postToPage('ZALOTOOL_BRIDGE_ERROR', {
+            ok: false,
+            code: error ? 'runtime_unavailable' : 'check_failed',
+            phase: 'check_failed',
+            error: error || resp?.error || 'Extension chưa xác nhận trang hiện tại.',
+          });
           return;
         }
 
