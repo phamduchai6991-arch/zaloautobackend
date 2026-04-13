@@ -498,6 +498,8 @@ const HAS_DIST = existsSync(join(DIST_DIR, 'index.html'));
 const DEFAULT_ALLOWED_ORIGINS = [
   'https://autozalo.vn',
   'https://www.autozalo.vn',
+  'https://zaloautofrontend.onrender.com',
+  'https://autozalo-frontend.onrender.com',
   'http://localhost:3001',
   'http://127.0.0.1:3001',
 ];

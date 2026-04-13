@@ -28,7 +28,10 @@ const VALID_PLANS = {
 // ─── Helpers ─────────────────────────────────────────────
 
 function writeJson(res, statusCode, payload) {
-  res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+  });
   res.end(JSON.stringify(payload));
 }
 
@@ -47,7 +50,7 @@ function readBody(req) {
 
 // ─── Handlers ────────────────────────────────────────────
 
-export async function handleCreateOrder(req, res, body) {
+export function handleCreateOrder(req, res, body) {
   const { userId, userEmail, planKey, period } = body || {};
 
   if (!userId || !userEmail) {
@@ -61,7 +64,7 @@ export async function handleCreateOrder(req, res, body) {
   }
 
   const amount = VALID_PLANS[planKey][period];
-  const order = await createOrder({ userId, userEmail, planKey, period, amount });
+  const order = createOrder({ userId, userEmail, planKey, period, amount });
 
   writeJson(res, 200, {
     ok: true,
@@ -78,9 +81,9 @@ export async function handleCreateOrder(req, res, body) {
   });
 }
 
-export async function handleGetOrder(req, res, code) {
+export function handleGetOrder(req, res, code) {
   if (!code) return writeJson(res, 400, { ok: false, error: 'Thiếu mã đơn hàng.' });
-  const order = await getOrder(code);
+  const order = getOrder(code);
   if (!order) return writeJson(res, 404, { ok: false, error: 'Đơn hàng không tồn tại.' });
 
   writeJson(res, 200, {
@@ -97,9 +100,9 @@ export async function handleGetOrder(req, res, code) {
   });
 }
 
-export async function handleGetUserOrders(req, res, userId) {
+export function handleGetUserOrders(req, res, userId) {
   if (!userId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId.' });
-  const orders = await getOrdersByUser(userId);
+  const orders = getOrdersByUser(userId);
   writeJson(res, 200, {
     ok: true,
     orders: orders.map((o) => ({
@@ -110,9 +113,9 @@ export async function handleGetUserOrders(req, res, userId) {
   });
 }
 
-export async function handleGetSubscription(req, res, userId) {
+export function handleGetSubscription(req, res, userId) {
   if (!userId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId.' });
-  const sub = await getSubscription(userId);
+  const sub = getSubscription(userId);
   writeJson(res, 200, {
     ok: true,
     subscription: sub
@@ -123,7 +126,7 @@ export async function handleGetSubscription(req, res, userId) {
 
 // ─── SePay Webhook ───────────────────────────────────────
 
-export async function handleSepayWebhook(req, res, body) {
+export function handleSepayWebhook(req, res, body) {
   const authHeader = req.headers['authorization'] || '';
   const providedKey = authHeader.replace(/^Apikey\s+/i, '').trim();
 
@@ -143,7 +146,7 @@ export async function handleSepayWebhook(req, res, body) {
     return writeJson(res, 200, { ok: true, message: 'Ignored: no transfer content.' });
   }
 
-  const order = await findPendingOrderByCode(content);
+  const order = findPendingOrderByCode(content);
   if (!order) {
     console.log(`[payment] No matching order for content: "${content}"`);
     return writeJson(res, 200, { ok: true, message: 'No matching order found.' });
@@ -154,19 +157,19 @@ export async function handleSepayWebhook(req, res, body) {
     return writeJson(res, 200, { ok: true, message: 'Amount insufficient.' });
   }
 
-  const paidOrder = await markOrderPaid(order.code, transactionId);
+  const paidOrder = markOrderPaid(order.code, transactionId);
   if (!paidOrder) {
     return writeJson(res, 200, { ok: true, message: 'Order already processed.' });
   }
 
-  const sub = await activateSubscription(paidOrder);
+  const sub = activateSubscription(paidOrder);
   console.log(`[payment] ✓ Order ${paidOrder.code} paid. Plan: ${paidOrder.planKey}/${paidOrder.period}. User: ${paidOrder.userEmail}. Expires: ${sub.expiresAt}`);
 
   writeJson(res, 200, { ok: true, message: 'Payment confirmed.', orderCode: paidOrder.code });
 }
 
-export async function cleanupExpiredOrders() {
-  const count = await cancelExpiredOrders();
+export function cleanupExpiredOrders() {
+  const count = cancelExpiredOrders();
   if (count > 0) console.log(`[payment] Cleaned up ${count} expired orders.`);
 }
 
