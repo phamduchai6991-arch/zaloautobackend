@@ -2363,9 +2363,189 @@
         return Promise.resolve(debugInfo);
       }
 
+      // ─── Account management actions ───
+
+      case 'removeFriend': {
+        return callFirstAvailableMethod(['removeFriend'], [args.userId]);
+      }
+
+      case 'leaveGroup': {
+        var lgId = normalizeConversationId(args.groupId || args.userId, true);
+        return callFirstAvailableMethod(['leaveGroup'], [lgId]);
+      }
+
+      case 'undoFriendRequest': {
+        return callFirstAvailableMethod(['undoFriendRequest'], [args.userId]);
+      }
+
+      case 'acceptFriendRequest': {
+        return callFirstAvailableMethod(['acceptFriendRequest'], [args.userId]);
+      }
+
+      case 'rejectFriendRequest': {
+        return callFirstAvailableMethod(['rejectFriendRequest'], [args.userId]);
+      }
+
+      case 'addUserToGroup': {
+        var pullUserId = String(args.userId || '').trim();
+        var pullGroupId = normalizeConversationId(args.targetGroupId, true);
+        return callFirstAvailableMethod(['addUserToGroup'], [pullUserId, pullGroupId]);
+      }
+
+      case 'joinGroupLink': {
+        var link = String(args.inviteLink || args.link || '').trim();
+        if (!link) return Promise.reject(new Error('Không tìm thấy link mời nhóm.'));
+        return callFirstAvailableMethod(['joinGroupLink'], [link]);
+      }
+
+      case 'setMute': {
+        // args: { action: 'mute'|'unmute', threadId, isGroup }
+        var muteIsGroup = !!args.isGroup;
+        var muteThreadId = normalizeConversationId(args.threadId || args.userId, muteIsGroup);
+        var muteAction = args.action === 'unmute' ? 0 : 1; // 0=unmute, 1=mute
+        var muteDuration = args.action === 'unmute' ? 0 : -1; // -1=forever
+        return callFirstAvailableMethod(['setMute'], [{ action: muteAction, duration: muteDuration }, muteThreadId, muteIsGroup ? 1 : 0]);
+      }
+
+      case 'findUser': {
+        var phone = String(args.phone || '').trim();
+        if (!phone) return Promise.reject(new Error('Thiếu số điện thoại để tra cứu.'));
+        return callFirstAvailableMethod(['findUser'], [phone]);
+      }
+
+      case 'getAllFriends': {
+        var zStorage = window.$$afmc && window.$$afmc.zStorage;
+        if (zStorage && typeof zStorage.getFriends === 'function') {
+          return zStorage.getFriends();
+        }
+        return callFirstAvailableMethod(['getAllFriends'], []);
+      }
+
+      case 'getAllGroups': {
+        var zStorage2 = window.$$afmc && window.$$afmc.zStorage;
+        if (zStorage2 && typeof zStorage2.getGroups === 'function') {
+          return zStorage2.getGroups();
+        }
+        return callFirstAvailableMethod(['getAllGroups'], []);
+      }
+
+      case 'fetchAccountInfo': {
+        return callFirstAvailableMethod(['fetchAccountInfo'], []);
+      }
+
+      case 'getSentFriendRequest': {
+        return callFirstAvailableMethod(['getSentFriendRequest'], []);
+      }
+
+      case 'getReceivedFriendRequests': {
+        return callFirstAvailableMethod(['getReceivedFriendRequests'], []);
+      }
+
+      case 'getGroupInfo': {
+        var gIds = Array.isArray(args.groupIds) ? args.groupIds : [args.groupId];
+        return callFirstAvailableMethod(['getGroupInfo', 'getGroupInfos'], [gIds]);
+      }
+
+      case 'runActionBatch': {
+        return runActionBatch(args);
+      }
+
       default:
         return Promise.reject(new Error('Phương thức API không xác định: ' + method));
     }
+  }
+
+  async function runActionBatch(args) {
+    var jobs = Array.isArray(args.jobs) ? args.jobs : [];
+    if (!jobs.length) return { ok: false, error: 'Danh sách thao tác rỗng.' };
+
+    var results = [];
+
+    for (var i = 0; i < jobs.length; i++) {
+      var job = jobs[i];
+      var actionType = String(job.actionType || '').trim();
+      var zid = String(job.zid || '').trim();
+      var isGroup = /^g/.test(zid) || !!job.isGroup;
+      var startedAt = new Date().toISOString();
+
+      if (!zid || zid === '—') {
+        results.push({ jobId: job.id, ok: false, status: 'failed', statusLabel: 'Thiếu Zalo ID', error: 'Không tìm thấy ID hợp lệ.', startedAt: startedAt, failedAt: new Date().toISOString(), provider: 'extension' });
+        continue;
+      }
+
+      try {
+        var apiResult = null;
+        if (actionType === 'remove_friend') {
+          apiResult = await executeApiCall('removeFriend', { userId: zid });
+          results.push({ jobId: job.id, ok: true, status: 'completed', statusLabel: 'Đã xóa bạn', startedAt: startedAt, sentAt: new Date().toISOString(), provider: 'extension', apiResult: apiResult });
+        } else if (actionType === 'leave_group') {
+          apiResult = await executeApiCall('leaveGroup', { groupId: zid });
+          var memberErrors = Array.isArray(apiResult && apiResult.memberError) ? apiResult.memberError : [];
+          if (memberErrors.indexOf(zid) !== -1) throw new Error('Zalo từ chối thao tác rời nhóm.');
+          results.push({ jobId: job.id, ok: true, status: 'completed', statusLabel: 'Đã rời nhóm', startedAt: startedAt, sentAt: new Date().toISOString(), provider: 'extension', apiResult: apiResult });
+        } else if (actionType === 'undo_friend_request') {
+          apiResult = await executeApiCall('undoFriendRequest', { userId: zid });
+          results.push({ jobId: job.id, ok: true, status: 'completed', statusLabel: 'Đã thu hồi lời mời', startedAt: startedAt, sentAt: new Date().toISOString(), provider: 'extension', apiResult: apiResult });
+        } else if (actionType === 'accept_friend_request') {
+          apiResult = await executeApiCall('acceptFriendRequest', { userId: zid });
+          results.push({ jobId: job.id, ok: true, status: 'completed', statusLabel: 'Đã chấp nhận lời mời', startedAt: startedAt, sentAt: new Date().toISOString(), provider: 'extension', apiResult: apiResult });
+        } else if (actionType === 'reject_friend_request') {
+          apiResult = await executeApiCall('rejectFriendRequest', { userId: zid });
+          results.push({ jobId: job.id, ok: true, status: 'completed', statusLabel: 'Đã từ chối lời mời', startedAt: startedAt, sentAt: new Date().toISOString(), provider: 'extension', apiResult: apiResult });
+        } else if (actionType === 'pull_group') {
+          var targetGroupId = String(job.targetGroupId || '').trim();
+          if (!targetGroupId) throw new Error('Chưa chọn nhóm đích.');
+          apiResult = await executeApiCall('addUserToGroup', { userId: zid, targetGroupId: targetGroupId });
+          var errorMembers = Array.isArray(apiResult && apiResult.errorMembers) ? apiResult.errorMembers : [];
+          if (errorMembers.indexOf(zid) !== -1) {
+            var errMsg = (apiResult.error_data && apiResult.error_data[zid] && apiResult.error_data[zid][0]) || 'Không thể mời vào nhóm.';
+            throw new Error(errMsg);
+          }
+          results.push({ jobId: job.id, ok: true, status: 'completed', statusLabel: 'Đã mời vào ' + (job.targetGroupName || 'nhóm'), startedAt: startedAt, sentAt: new Date().toISOString(), provider: 'extension', apiResult: apiResult });
+        } else if (actionType === 'join_group') {
+          try {
+            apiResult = await executeApiCall('joinGroupLink', { inviteLink: job.inviteLink || job.link });
+            results.push({ jobId: job.id, ok: true, status: 'completed', statusLabel: 'Đã tham gia nhóm', startedAt: startedAt, sentAt: new Date().toISOString(), provider: 'extension', apiResult: apiResult });
+          } catch (joinErr) {
+            var joinCode = typeof joinErr.code === 'number' ? joinErr.code : null;
+            if (joinCode === 178) {
+              results.push({ jobId: job.id, ok: true, status: 'skipped', statusLabel: 'Đã ở trong nhóm', startedAt: startedAt, sentAt: new Date().toISOString(), provider: 'extension' });
+            } else if (joinCode === 240) {
+              results.push({ jobId: job.id, ok: true, status: 'pending', statusLabel: 'Đã gửi yêu cầu vào nhóm', startedAt: startedAt, sentAt: new Date().toISOString(), provider: 'extension' });
+            } else {
+              throw joinErr;
+            }
+          }
+        } else if (actionType === 'mute') {
+          apiResult = await executeApiCall('setMute', { action: 'mute', threadId: zid, isGroup: isGroup });
+          results.push({ jobId: job.id, ok: true, status: 'completed', statusLabel: 'Đã tắt thông báo', startedAt: startedAt, sentAt: new Date().toISOString(), provider: 'extension', apiResult: apiResult });
+        } else if (actionType === 'unmute') {
+          apiResult = await executeApiCall('setMute', { action: 'unmute', threadId: zid, isGroup: isGroup });
+          results.push({ jobId: job.id, ok: true, status: 'completed', statusLabel: 'Đã bật thông báo', startedAt: startedAt, sentAt: new Date().toISOString(), provider: 'extension', apiResult: apiResult });
+        } else {
+          throw new Error('Action không được hỗ trợ: ' + actionType);
+        }
+      } catch (err) {
+        results.push({ jobId: job.id, ok: false, status: 'failed', statusLabel: actionType === 'remove_friend' ? 'Xóa bạn thất bại' : actionType === 'leave_group' ? 'Rời nhóm thất bại' : actionType === 'undo_friend_request' ? 'Thu hồi thất bại' : actionType === 'accept_friend_request' ? 'Chấp nhận thất bại' : actionType === 'reject_friend_request' ? 'Từ chối thất bại' : actionType === 'pull_group' ? 'Kéo nhóm thất bại' : actionType === 'join_group' ? 'Tham gia thất bại' : actionType === 'mute' ? 'Tắt TB thất bại' : actionType === 'unmute' ? 'Bật TB thất bại' : 'Thao tác thất bại', error: err.message || String(err), startedAt: startedAt, failedAt: new Date().toISOString(), provider: 'extension' });
+      }
+
+      // Delay between jobs
+      if (i < jobs.length - 1 && job.delayWindow) {
+        var dw = String(job.delayWindow).split('-').map(Number);
+        var minDel = dw[0] || 1000;
+        var maxDel = dw[1] || minDel;
+        var waitMs = minDel + Math.floor(Math.random() * (maxDel - minDel));
+        if (waitMs > 0) await new Promise(function (r) { setTimeout(r, waitMs); });
+      }
+    }
+
+    return {
+      ok: true,
+      provider: 'extension',
+      accepted: results.filter(function (r) { return r.ok; }).length,
+      failed: results.filter(function (r) { return !r.ok; }).length,
+      results: results,
+    };
   }
 
   // Listen for API calls from ISOLATED world (zalo-bridge.js)
