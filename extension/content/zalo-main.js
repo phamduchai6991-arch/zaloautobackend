@@ -515,8 +515,8 @@
     }
 
     // Load AES encoder module — needed for decodeAES hook
-    // Try known ID first, then search all webpack modules dynamically
-    var knownEncoderIds = ['z0WU', 'ZEncoder', 'aes_utils'];
+    // Strategy A: Try known webpack IDs (including variations Zalo may use)
+    var knownEncoderIds = ['z0WU', 'ZEncoder', 'aes_utils', 'aes', 'crypto_utils', 'encrypt'];
     for (var ki = 0; ki < knownEncoderIds.length && !_encoderModule; ki++) {
       try {
         var eMod = _wr(knownEncoderIds[ki]);
@@ -528,11 +528,11 @@
       } catch (_) {}
     }
 
-    // Dynamic search: iterate webpack module cache to find decodeAES
+    // Strategy B: Scan webpack module cache for decodeAES or encodeAES
     if (!_encoderModule && _wr && _wr.c) {
       var moduleCache = _wr.c;
       var cacheKeys = Object.keys(moduleCache);
-      console.log('[ZaloMain] Searching', cacheKeys.length, 'webpack modules for decodeAES...');
+      console.log('[ZaloMain] Searching', cacheKeys.length, 'webpack modules for decodeAES/encodeAES...');
       for (var ci = 0; ci < cacheKeys.length; ci++) {
         try {
           var cachedMod = moduleCache[cacheKeys[ci]];
@@ -550,12 +550,85 @@
             console.log('[ZaloMain] Found encoder module (direct export), key:', cacheKeys[ci]);
             break;
           }
+          // Check for encodeAES (may be bundled differently)
+          if (exp.default && typeof exp.default.encodeAES === 'function') {
+            _encoderModule = exp.default;
+            console.log('[ZaloMain] Found encoder module via encodeAES, key:', cacheKeys[ci]);
+            break;
+          }
+          if (typeof exp.encodeAES === 'function') {
+            _encoderModule = exp;
+            console.log('[ZaloMain] Found encoder module via encodeAES (direct), key:', cacheKeys[ci]);
+            break;
+          }
         } catch (_) {}
       }
     }
 
+    // Strategy C: Scan module SOURCE CODE for "decodeAES" string, then load only matching modules
+    if (!_encoderModule && _wr && _wr.m) {
+      var allModuleIds = Object.keys(_wr.m);
+      var candidateIds = [];
+      for (var si = 0; si < allModuleIds.length; si++) {
+        try {
+          var src = _wr.m[allModuleIds[si]];
+          var srcStr = typeof src === 'function' ? src.toString() : String(src || '');
+          if (srcStr.indexOf('decodeAES') !== -1 || srcStr.indexOf('encodeAES') !== -1) {
+            candidateIds.push(allModuleIds[si]);
+          }
+        } catch (_) {}
+      }
+      console.log('[ZaloMain] Found', candidateIds.length, 'candidate AES modules from', allModuleIds.length, 'total:', candidateIds.join(', '));
+      for (var ci2 = 0; ci2 < candidateIds.length && !_encoderModule; ci2++) {
+        try {
+          var tryMod = _wr(candidateIds[ci2]);
+          var tryDef = tryMod && (tryMod.default || tryMod);
+          if (tryDef && typeof tryDef.decodeAES === 'function') {
+            _encoderModule = tryDef;
+            console.log('[ZaloMain] Found encoder module by source scan, ID:', candidateIds[ci2]);
+          } else if (tryDef && typeof tryDef.encodeAES === 'function') {
+            _encoderModule = tryDef;
+            console.log('[ZaloMain] Found encoder module (encodeAES only) by source scan, ID:', candidateIds[ci2]);
+          }
+          // Also check nested exports
+          if (!_encoderModule && tryMod) {
+            var tryKeys = Object.keys(tryMod);
+            for (var tk = 0; tk < tryKeys.length && !_encoderModule; tk++) {
+              var tryExp = tryMod[tryKeys[tk]];
+              if (tryExp && typeof tryExp.decodeAES === 'function') {
+                _encoderModule = tryExp;
+                console.log('[ZaloMain] Found encoder module (nested export "' + tryKeys[tk] + '") by source scan, ID:', candidateIds[ci2]);
+              }
+            }
+          }
+        } catch (_) {}
+      }
+    }
+
+    // Strategy D: Last resort — exhaustive search loading all unloaded modules
+    if (!_encoderModule && _wr && _wr.m) {
+      var unloadedIds = Object.keys(_wr.m).filter(function (id) { return !(_wr.c && _wr.c[id]); });
+      if (unloadedIds.length < 2000) {
+        console.log('[ZaloMain] Exhaustive search: loading', unloadedIds.length, 'unloaded modules...');
+        for (var mi = 0; mi < unloadedIds.length && !_encoderModule; mi++) {
+          try {
+            var tryMod2 = _wr(unloadedIds[mi]);
+            var tryDef2 = tryMod2 && (tryMod2.default || tryMod2);
+            if (tryDef2 && typeof tryDef2.decodeAES === 'function') {
+              _encoderModule = tryDef2;
+              console.log('[ZaloMain] Found encoder module by exhaustive search, ID:', unloadedIds[mi]);
+            }
+          } catch (_) {}
+        }
+      } else {
+        console.warn('[ZaloMain] Too many unloaded modules (' + unloadedIds.length + '), skipping exhaustive search');
+      }
+    }
+
     if (!_encoderModule) {
-      console.warn('[ZaloMain] decodeAES module NOT found — lockViewMember bypass unavailable');
+      console.warn('[ZaloMain] decodeAES module NOT found — will rely on getGroupInfos API + currentMems.dName for names');
+    } else {
+      console.log('[ZaloMain] Encoder module loaded, has decodeAES:', typeof _encoderModule.decodeAES, 'encodeAES:', typeof _encoderModule.encodeAES);
     }
 
     // Load domains module — try known IDs
@@ -1642,6 +1715,7 @@
           if (!groupInfoMap[gid]) {
             groupInfoMap[gid] = gdata;
           } else {
+            // Merge additional members from subsequent pages
             var existing = groupInfoMap[gid];
             if (Array.isArray(gdata.currentMems) && gdata.currentMems.length) {
               existing.currentMems = (existing.currentMems || []).concat(gdata.currentMems);
@@ -1655,6 +1729,7 @@
           }
         });
 
+        // Check hasMoreMember for any group
         var hasMore = false;
         Object.keys(gmap).forEach(function (gid) {
           if (Number(gmap[gid].hasMoreMember) > 0) hasMore = true;
@@ -1673,6 +1748,7 @@
       needsRawFallback = true;
       console.log('[ZaloMain] getGroupInfos returned nothing, trying raw HTTP');
     } else {
+      // Check if any group returned far fewer members than totalMember
       Object.keys(groupInfoMap).forEach(function (gid) {
         var g = groupInfoMap[gid];
         var totalFromApi = (g.currentMems || []).length + (g.memVerList || []).length;
@@ -1685,9 +1761,11 @@
     }
 
     // Strategy 2: Raw HTTP fetch — bypass Zalo's client-side filtering entirely
+    // Same approach as zalo-api-final: encodeAES → fetch → decodeAES
     if (needsRawFallback && _encoderModule && typeof _encoderModule.encodeAES === 'function') {
       console.log('[ZaloMain] Attempting raw HTTP to /api/group/getmg-v2...');
       try {
+        // Build gridVerMap: {groupId: 0, ...}
         var gridVerMap = {};
         groupIds.forEach(function (gid) { gridVerMap[gid] = 0; });
         var rawParams = JSON.stringify({ gridVerMap: JSON.stringify(gridVerMap) });
@@ -1696,7 +1774,9 @@
         if (!encryptedParams) {
           console.warn('[ZaloMain] encodeAES returned null');
         } else {
+          // Find the group API domain from zpwServiceMap or network
           var groupDomains = [];
+          // Try to get zpwServiceMap from _httpModule internals
           try {
             if (_httpModule && _httpModule._zpwServiceMap) {
               var smap = _httpModule._zpwServiceMap;
@@ -1704,6 +1784,7 @@
             }
           } catch (_) {}
 
+          // Search webpack modules for zpwServiceMap
           if (!groupDomains.length && _wr && _wr.c) {
             var wrCache = _wr.c;
             var wrKeys = Object.keys(wrCache);
@@ -1722,6 +1803,7 @@
             }
           }
 
+          // Try localStorage/sessionStorage for zpw_service_map
           if (!groupDomains.length) {
             [window.localStorage, window.sessionStorage].forEach(function (storage) {
               if (!storage || groupDomains.length) return;
@@ -1742,7 +1824,9 @@
             });
           }
 
+          // Fallback: monitor network requests that went to group API
           if (!groupDomains.length) {
+            // Try common group API domains from performance entries
             try {
               var perfEntries = performance.getEntriesByType('resource');
               for (var pi = 0; pi < perfEntries.length; pi++) {
@@ -1759,6 +1843,7 @@
             } catch (_) {}
           }
 
+          // Get common URL params (zpw_ver, zpw_type)
           var commonQs = '';
           try {
             if (_httpModule && typeof _httpModule._getCommonParams === 'function') {
@@ -1786,8 +1871,13 @@
                 console.log('[ZaloMain] raw HTTP response:', rawResponse ? 'error_code=' + rawResponse.error_code : 'null');
 
                 if (rawResponse && rawResponse.error_code === 0 && rawResponse.data) {
+                  // Decrypt the response data
                   var decryptedStr = null;
-                  var decFn = _encoderModule.decodeAES_original || _encoderModule.decodeAES;
+                  if (!_encoderModule) {
+                    console.warn('[ZaloMain] raw HTTP: encoder module not available for decrypt');
+                    continue;
+                  }
+                  var decFn = _encoderModule.decodeAES; // Use hooked version for lockViewMember bypass
                   if (typeof decFn === 'function') {
                     decryptedStr = decFn(rawResponse.data, 0);
                   }
@@ -1807,6 +1897,7 @@
                       apiSuccess = true;
                       Object.keys(rawGridMap).forEach(function (gid) {
                         var g = rawGridMap[gid];
+                        // Force unlock lockViewMember since we control the data
                         if (g && g.setting) g.setting.lockViewMember = 0;
                         groupInfoMap[gid] = g;
                       });
@@ -1819,7 +1910,7 @@
                           'memVerList:', (rg.memVerList || []).length,
                           'memberIds:', (rg.memberIds || []).length);
                       });
-                      break;
+                      break; // Success, no need to try other domains
                     }
                   } else {
                     console.warn('[ZaloMain] raw HTTP: decodeAES returned null');
@@ -2001,6 +2092,7 @@
             var profileParams = JSON.stringify({ friend_pversion_map: versionedIds });
             var encProfileParams = _encoderModule.encodeAES(profileParams);
             if (encProfileParams) {
+              // Find profile API domain
               var profileDomains = [];
               if (!profileDomains.length && _wr && _wr.c) {
                 var prCache = _wr.c;
@@ -2018,6 +2110,7 @@
                   } catch (_) {}
                 }
               }
+              // Also try localStorage
               if (!profileDomains.length) {
                 [window.localStorage, window.sessionStorage].forEach(function (storage) {
                   if (!storage || profileDomains.length) return;
@@ -2034,6 +2127,7 @@
                   }
                 });
               }
+              // Try performance API
               if (!profileDomains.length) {
                 try {
                   var pe = performance.getEntriesByType('resource');
@@ -2065,7 +2159,10 @@
                 );
 
                 if (profileResp && profileResp.error_code === 0 && profileResp.data) {
-                  var decFn2 = _encoderModule.decodeAES_original || _encoderModule.decodeAES;
+                  if (!_encoderModule) {
+                    console.warn('[ZaloMain] raw HTTP profile: encoder module not available for decrypt');
+                  } else {
+                  var decFn2 = _encoderModule.decodeAES; // Use hooked version
                   var decStr2 = typeof decFn2 === 'function' ? decFn2(profileResp.data, 0) : null;
                   if (decStr2) {
                     var decJson2 = JSON.parse(decStr2);
@@ -2077,8 +2174,8 @@
                       indexProfileByKey(groupProfileMap, decJson2.profiles);
                     }
                   }
+                  } // end else (_encoderModule exists)
                 }
-              }
             }
           } catch (e) {
             console.warn('[ZaloMain] raw HTTP getGroupMembersInfo failed:', e.message);
