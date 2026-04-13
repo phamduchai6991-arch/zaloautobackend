@@ -2159,23 +2159,24 @@
                 );
 
                 if (profileResp && profileResp.error_code === 0 && profileResp.data) {
-                  if (!_encoderModule) {
-                    console.warn('[ZaloMain] raw HTTP profile: encoder module not available for decrypt');
-                  } else {
-                  var decFn2 = _encoderModule.decodeAES; // Use hooked version
-                  var decStr2 = typeof decFn2 === 'function' ? decFn2(profileResp.data, 0) : null;
-                  if (decStr2) {
-                    var decJson2 = JSON.parse(decStr2);
-                    if (decJson2.data && decJson2.data.profiles) {
-                      console.log('[ZaloMain] raw HTTP getGroupMembersInfo got', Object.keys(decJson2.data.profiles).length, 'profiles');
-                      indexProfileByKey(groupProfileMap, decJson2.data.profiles);
-                    } else if (decJson2.profiles) {
-                      console.log('[ZaloMain] raw HTTP getGroupMembersInfo got', Object.keys(decJson2.profiles).length, 'profiles');
-                      indexProfileByKey(groupProfileMap, decJson2.profiles);
+                  if (_encoderModule) {
+                    var decFn2 = _encoderModule.decodeAES; // Use hooked version
+                    var decStr2 = typeof decFn2 === 'function' ? decFn2(profileResp.data, 0) : null;
+                    if (decStr2) {
+                      var decJson2 = JSON.parse(decStr2);
+                      if (decJson2.data && decJson2.data.profiles) {
+                        console.log('[ZaloMain] raw HTTP getGroupMembersInfo got', Object.keys(decJson2.data.profiles).length, 'profiles');
+                        indexProfileByKey(groupProfileMap, decJson2.data.profiles);
+                      } else if (decJson2.profiles) {
+                        console.log('[ZaloMain] raw HTTP getGroupMembersInfo got', Object.keys(decJson2.profiles).length, 'profiles');
+                        indexProfileByKey(groupProfileMap, decJson2.profiles);
+                      }
                     }
+                  } else {
+                    console.warn('[ZaloMain] raw HTTP profile: encoder module not available for decrypt');
                   }
-                  } // end else (_encoderModule exists)
                 }
+              }
             }
           } catch (e) {
             console.warn('[ZaloMain] raw HTTP getGroupMembersInfo failed:', e.message);
