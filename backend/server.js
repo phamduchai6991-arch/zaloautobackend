@@ -773,6 +773,50 @@ const server = createServer(async (req, res) => {
 
       // ─── Zalo API proxy routes (uses zalo-api-final) ───
 
+      // POST /api/zalo/account/ping — lightweight cookie validity check
+      if (req.method === 'POST' && url === '/api/zalo/account/ping') {
+        const body = await readBody(req);
+        let account = body?.account;
+        if (!account) {
+          return writeJson(res, 400, { ok: false, error: 'Thiếu account.' });
+        }
+
+        // Enrich account from DB if needed
+        try {
+          const hasCookies = Boolean(
+            (Array.isArray(account?.cookies) && account.cookies.length > 0) ||
+            (typeof account?.cookie === 'string' && account.cookie.trim()),
+          );
+          if (!hasCookies && account.ownerUserId && (account.id || account.zaloId || account.userId)) {
+            const zaloId = account.id || account.zaloId || account.userId;
+            const dbAccount = await getAccount(account.ownerUserId, zaloId);
+            if (dbAccount) {
+              account = { ...dbAccount, ...account, cookie: dbAccount.cookie, cookies: dbAccount.cookies, imei: dbAccount.imei || account.imei };
+            }
+          }
+        } catch { /* ignore enrichment failure */ }
+
+        const userAgent = getUserAgent(body, req);
+        try {
+          const { api } = await createApiClient(account, userAgent);
+          const profile = await api.fetchAccountInfo();
+          return writeJson(res, 200, {
+            ok: true,
+            valid: true,
+            profile: {
+              name: profile?.name || profile?.displayName || '',
+              avatar: profile?.avatar || '',
+            },
+          });
+        } catch (error) {
+          return writeJson(res, 200, {
+            ok: true,
+            valid: false,
+            error: error instanceof Error ? error.message : 'Phiên Zalo đã hết hạn.',
+          });
+        }
+      }
+
       if (req.method === 'POST' && url === '/api/zalo/account/sync') {
         const body = await readBody(req);
         // Enrich account from DB if frontend sent incomplete session data
