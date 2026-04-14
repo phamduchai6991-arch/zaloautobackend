@@ -698,7 +698,7 @@ const server = createServer(async (req, res) => {
         // Look up actual subscription server-side — don't trust client planKey
         const { getSubscription } = await import('./lib/paymentStore.js');
         const sub = await getSubscription(userId);
-        const planKey = (sub?.status === 'active' ? sub.planKey : null) || 'basic';
+        const planKey = (sub?.status === 'active' ? sub.planKey : null) || 'free';
         const result = await registerAccount({ userId, planKey, zaloId, zaloName, zaloAvatar, zaloPhone, accountData });
         return writeJson(res, result.ok ? 200 : 403, result);
       }

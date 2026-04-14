@@ -1,6 +1,6 @@
 import { query } from './db.js';
 
-const PLAN_LIMITS = { basic: 1, plus: 3, pro: 10 };
+const PLAN_LIMITS = { free: 1, basic: 1, plus: 3, pro: 10 };
 let schemaReadyPromise = null;
 
 async function ensureAccountSchema() {
@@ -87,7 +87,7 @@ export async function countAccountsByUser(userId) {
  */
 export async function registerAccount({ userId, planKey, zaloId, zaloName, zaloAvatar, zaloPhone, accountData = null }) {
   await ensureAccountSchema();
-  const limit = PLAN_LIMITS[planKey] ?? PLAN_LIMITS.basic;
+  const limit = PLAN_LIMITS[planKey] ?? PLAN_LIMITS.free;
   const accountBlob = accountData ? JSON.stringify(accountData) : null;
   const syncStatus = accountData?.syncStatus || null;
   const syncedAt = accountData?.syncedAt || null;
