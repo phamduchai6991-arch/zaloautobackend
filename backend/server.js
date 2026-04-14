@@ -21,6 +21,7 @@ import {
 } from './lib/adminHandlers.js';
 import { handleSyncUser } from './lib/userHandlers.js';
 import {
+  getAccount,
   getAccountsByUser,
   registerAccount,
   removeAccount,
@@ -485,6 +486,14 @@ if (existsSync(envPath)) {
   }
 }
 
+// ─── Process-level crash guards ─────────────────────────
+process.on('uncaughtException', (err) => {
+  console.error('[backend] uncaughtException (kept alive):', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[backend] unhandledRejection (kept alive):', reason);
+});
+
 const PORT = Number(process.env.PORT || 3000);
 const configuredDistDir = process.env.FRONTEND_DIST_DIR?.trim();
 const DIST_DIR = configuredDistDir
@@ -724,7 +733,29 @@ const server = createServer(async (req, res) => {
 
       if (req.method === 'POST' && url === '/api/zalo/groups/invite-targets') {
         const body = await readBody(req);
-        return handleGroupInviteTargets(req, res, body);
+        // Enrich account from DB if frontend sent incomplete session data
+        try {
+          const acct = body?.account;
+          const hasCookies = Boolean(
+            (Array.isArray(acct?.cookies) && acct.cookies.length > 0) ||
+            (typeof acct?.cookie === 'string' && acct.cookie.trim()),
+          );
+          if (acct && !hasCookies && acct.ownerUserId && (acct.id || acct.zaloId || acct.userId)) {
+            const zaloId = acct.id || acct.zaloId || acct.userId;
+            const dbAccount = await getAccount(acct.ownerUserId, zaloId);
+            if (dbAccount) {
+              body.account = { ...dbAccount, ...acct, cookie: dbAccount.cookie, cookies: dbAccount.cookies, imei: dbAccount.imei || acct.imei, decryptKey: dbAccount.decryptKey || acct.decryptKey, commonParams: dbAccount.commonParams || acct.commonParams, UIN: dbAccount.UIN || acct.UIN, sessionSource: dbAccount.sessionSource || acct.sessionSource };
+            }
+          }
+        } catch (enrichErr) {
+          console.warn('[backend] Account enrichment from DB failed:', enrichErr.message);
+        }
+        try {
+          return await handleGroupInviteTargets(req, res, body);
+        } catch (handlerErr) {
+          console.error('[backend] invite-targets handler crashed:', handlerErr);
+          return writeJson(res, 500, { ok: false, error: handlerErr?.message || 'Lỗi xử lý thành viên nhóm.' });
+        }
       }
 
       if (req.method === 'POST' && url === '/api/zalo/actions/batch') {

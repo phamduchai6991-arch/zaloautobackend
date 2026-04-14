@@ -145,6 +145,15 @@ export async function removeAccount(userId, zaloId) {
   return result.rowCount > 0;
 }
 
+export async function getAccount(userId, zaloId) {
+  await ensureAccountSchema();
+  const result = await query(
+    'SELECT * FROM zalo_accounts WHERE user_id = $1 AND zalo_id = $2',
+    [userId, zaloId],
+  );
+  return result.rows.length > 0 ? rowToAccount(result.rows[0]) : null;
+}
+
 export async function touchAccount(userId, zaloId) {
   await ensureAccountSchema();
   await query(
