@@ -49,6 +49,8 @@ function writeNdjsonLine(res, data) {
 async function handleSendBatchStream(req, res, body) {
   const account = body?.account;
   const jobs = Array.isArray(body?.jobs) ? body.jobs : [];
+  const messageTemplates = Array.isArray(body?.messageTemplates) ? body.messageTemplates : [];
+  const rotateMessageEvery = Math.max(1, parseInt(body?.rotateMessageEvery, 10) || 100);
 
   if (!account) {
     writeJson(res, 400, { ok: false, error: 'Thiếu account để gửi tin.' });
@@ -111,12 +113,20 @@ async function handleSendBatchStream(req, res, body) {
 
   let accepted = 0;
   let failed = 0;
+  let templateIdx = 0;
+  let templateCounter = 0;
 
   for (let index = 0; index < jobs.length; index += 1) {
     const job = jobs[index];
     const groupJob = isGroupJob(job);
     const zid = normalizeThreadId(job?.zid, groupJob);
-    const content = String(job?.content || '').trim();
+    // Use rotating templates if provided, else job.content
+    let content;
+    if (messageTemplates.length > 0) {
+      content = String(messageTemplates[templateIdx % messageTemplates.length] || '').trim();
+    } else {
+      content = String(job?.content || '').trim();
+    }
     const hasAttachments = attachments.length > 0;
     const startedAt = new Date().toISOString();
 
@@ -170,6 +180,12 @@ async function handleSendBatchStream(req, res, body) {
         error: error instanceof Error ? error.message : 'Gửi tin nhắn thất bại.',
         startedAt, failedAt: new Date().toISOString(), provider: 'server',
       });
+    }
+
+    templateCounter++;
+    if (messageTemplates.length > 1 && templateCounter >= rotateMessageEvery) {
+      templateIdx++;
+      templateCounter = 0;
     }
 
     if (index < jobs.length - 1) {
@@ -1100,6 +1116,8 @@ const server = createServer(async (req, res) => {
           ? 'Bạn là trợ lý viết lại tin nhắn kết bạn Zalo. Hãy viết lại nội dung sau thành 3 phiên bản khác nhau: 1 bản lịch sự chuyên nghiệp, 1 bản thân thiện gần gũi, 1 bản ngắn gọn súc tích. Mỗi bản tối đa 150 ký tự. Trả về JSON array gồm 3 string, không giải thích thêm.'
           : target === 'rotation'
           ? 'Bạn là trợ lý tạo mẫu tin nhắn kết bạn Zalo để luân phiên sử dụng (chống spam). Dựa trên nội dung gốc, hãy tạo 5 phiên bản khác nhau nhưng cùng ý nghĩa: mỗi bản có cách diễn đạt, phong cách, cấu trúc câu khác nhau để tránh bị hệ thống phát hiện spam. Mỗi bản tối đa 150 ký tự. Trả về JSON array gồm 5 string, không giải thích thêm.'
+          : target === 'message_rotation'
+          ? 'Bạn là trợ lý tạo mẫu tin nhắn Zalo để luân phiên sử dụng (chống spam). Dựa trên nội dung gốc, hãy tạo 5 phiên bản khác nhau nhưng cùng ý nghĩa: mỗi bản có cách diễn đạt, phong cách, cấu trúc câu khác nhau để tránh bị hệ thống phát hiện spam. Trả về JSON array gồm 5 string, không giải thích thêm.'
           : 'Bạn là trợ lý viết lại tin nhắn Zalo. Hãy viết lại nội dung sau thành 3 phiên bản khác nhau: 1 bản lịch sự chuyên nghiệp, 1 bản thân thiện gần gũi, 1 bản ngắn gọn súc tích. Trả về JSON array gồm 3 string, không giải thích thêm.';
         try {
           const resp = await fetch('https://api.deepseek.com/chat/completions', {
