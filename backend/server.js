@@ -303,6 +303,173 @@ async function handleFriendRequestBatchStream(req, res, body) {
   res.end();
 }
 
+// ─── Rotation: round-robin friend requests across multiple accounts ─────
+async function handleFriendRequestRotateStream(req, res, body) {
+  const rotationAccounts = Array.isArray(body?.accounts) ? body.accounts : [];
+  const jobs = Array.isArray(body?.jobs) ? body.jobs : [];
+  const batchSize = Math.max(1, parseInt(body?.batchSize, 10) || 100);
+  const messageTemplates = Array.isArray(body?.messageTemplates) ? body.messageTemplates : [];
+  const rotateMessageEvery = Math.max(1, parseInt(body?.rotateMessageEvery, 10) || 100);
+
+  if (!rotationAccounts.length || rotationAccounts.length < 2) {
+    writeJson(res, 400, { ok: false, error: 'Cần ít nhất 2 tài khoản để luân phiên.' });
+    return;
+  }
+  if (!jobs.length) {
+    writeJson(res, 400, { ok: false, error: 'Danh sách job kết bạn rỗng.' });
+    return;
+  }
+
+  const userAgent = getUserAgent(body, req);
+
+  // Create API clients for each account
+  const clients = [];
+  for (let i = 0; i < rotationAccounts.length; i++) {
+    const acct = rotationAccounts[i];
+    try {
+      const { api } = await createApiClient(acct, userAgent);
+      clients.push({ api, account: acct, label: acct.name || acct.phone || `Nick ${i + 1}`, index: i });
+    } catch (error) {
+      // Skip accounts that can't be initialized; report once streaming starts
+      clients.push({ api: null, account: acct, label: acct.name || acct.phone || `Nick ${i + 1}`, index: i, error: error?.message || 'Khởi tạo thất bại' });
+    }
+  }
+
+  const liveClients = clients.filter((c) => c.api);
+  if (!liveClients.length) {
+    writeJson(res, 500, { ok: false, error: 'Không thể khởi tạo phiên Zalo cho bất kỳ tài khoản nào.' });
+    return;
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'application/x-ndjson',
+    'Transfer-Encoding': 'chunked',
+    'Cache-Control': 'no-cache',
+  });
+
+  // Report failed account initializations
+  for (const c of clients) {
+    if (!c.api) {
+      writeNdjsonLine(res, { _accountError: true, accountIndex: c.index, accountLabel: c.label, error: c.error });
+    }
+  }
+
+  let accepted = 0;
+  let failed = 0;
+  let clientIdx = 0;
+  let batchCounter = 0; // requests sent by current account in this batch
+  let templateIdx = 0;
+  let templateCounter = 0; // requests since last message rotation
+
+  for (let index = 0; index < jobs.length; index += 1) {
+    const job = jobs[index];
+    const userId = String(job?.zid || '').trim();
+
+    // Pick the current note — use rotating templates if provided, else job.note
+    let note;
+    if (messageTemplates.length > 0) {
+      note = String(messageTemplates[templateIdx % messageTemplates.length] || '').trim();
+    } else {
+      note = String(job?.note || '').trim();
+    }
+
+    const client = liveClients[clientIdx % liveClients.length];
+    const startedAt = new Date().toISOString();
+
+    writeNdjsonLine(res, {
+      jobId: job.id,
+      status: 'running',
+      statusLabel: `[${client.label}] Đang kết bạn ${index + 1}/${jobs.length}`,
+      startedAt,
+      provider: 'server',
+      accountIndex: client.index,
+      accountLabel: client.label,
+    });
+
+    if (!userId || userId === '—') {
+      failed++;
+      writeNdjsonLine(res, {
+        jobId: job?.id, ok: false, status: 'failed',
+        statusLabel: 'Thiếu Zalo ID',
+        error: 'Job không có Zalo ID hợp lệ.',
+        startedAt, failedAt: new Date().toISOString(), provider: 'server',
+        accountIndex: client.index, accountLabel: client.label,
+      });
+    } else {
+      try {
+        const apiResult = await client.api.sendFriendRequest(note, userId);
+        accepted++;
+        writeNdjsonLine(res, {
+          jobId: job.id, ok: true, status: 'sent',
+          statusLabel: `[${client.label}] Đã gửi lời mời`,
+          startedAt, sentAt: new Date().toISOString(), provider: 'server',
+          apiResult, accountIndex: client.index, accountLabel: client.label,
+        });
+      } catch (error) {
+        const code = typeof error?.code === 'number' ? error.code : null;
+        if (code === 222) {
+          accepted++;
+          writeNdjsonLine(res, {
+            jobId: job.id, ok: true, status: 'accepted',
+            statusLabel: `[${client.label}] Đã chấp nhận lời mời`,
+            startedAt, sentAt: new Date().toISOString(), provider: 'server',
+            accountIndex: client.index, accountLabel: client.label,
+          });
+        } else if (code === 225) {
+          accepted++;
+          writeNdjsonLine(res, {
+            jobId: job.id, ok: true, status: 'skipped',
+            statusLabel: `[${client.label}] Đã là bạn bè`,
+            startedAt, sentAt: new Date().toISOString(), provider: 'server',
+            accountIndex: client.index, accountLabel: client.label,
+          });
+        } else {
+          failed++;
+          writeNdjsonLine(res, {
+            jobId: job?.id, ok: false, status: 'failed',
+            statusLabel: `[${client.label}] Kết bạn thất bại`,
+            error: error instanceof Error ? error.message : 'Gửi lời mời kết bạn thất bại.',
+            startedAt, failedAt: new Date().toISOString(), provider: 'server',
+            accountIndex: client.index, accountLabel: client.label,
+          });
+        }
+      }
+    }
+
+    batchCounter++;
+    templateCounter++;
+
+    // Rotate message template
+    if (messageTemplates.length > 1 && templateCounter >= rotateMessageEvery) {
+      templateIdx++;
+      templateCounter = 0;
+    }
+
+    // Rotate to next account after batchSize requests
+    if (batchCounter >= batchSize) {
+      clientIdx++;
+      batchCounter = 0;
+
+      // Extra delay between account switches
+      writeNdjsonLine(res, {
+        _rotationSwitch: true,
+        fromAccount: client.label,
+        toAccount: liveClients[(clientIdx) % liveClients.length]?.label,
+        sentSoFar: index + 1,
+        remaining: jobs.length - index - 1,
+      });
+    }
+
+    if (index < jobs.length - 1) {
+      const delayMs = getDelayMs(job?.delayWindow);
+      if (delayMs > 0) await sleep(delayMs);
+    }
+  }
+
+  writeNdjsonLine(res, { _done: true, ok: true, accepted, failed, rotationAccountCount: liveClients.length });
+  res.end();
+}
+
 async function handleActionBatchStream(req, res, body) {
   const account = body?.account;
   const jobs = Array.isArray(body?.jobs) ? body.jobs : [];
@@ -847,6 +1014,30 @@ const server = createServer(async (req, res) => {
       if (req.method === 'POST' && url === '/api/zalo/friends/requests/batch') {
         const body = await readBody(req);
         return handleFriendRequestBatchStream(req, res, body);
+      }
+
+      if (req.method === 'POST' && url === '/api/zalo/friends/requests/batch/rotate') {
+        const body = await readBody(req);
+        // Enrich each rotation account from DB
+        const rotAccounts = Array.isArray(body?.accounts) ? body.accounts : [];
+        for (let ri = 0; ri < rotAccounts.length; ri++) {
+          try {
+            const acct = rotAccounts[ri];
+            const hasCookies = Boolean(
+              (Array.isArray(acct?.cookies) && acct.cookies.length > 0) ||
+              (typeof acct?.cookie === 'string' && acct.cookie.trim()),
+            );
+            if (acct && !hasCookies && acct.ownerUserId && (acct.id || acct.zaloId || acct.userId)) {
+              const zaloId = acct.id || acct.zaloId || acct.userId;
+              const dbAccount = await getAccount(acct.ownerUserId, zaloId);
+              if (dbAccount) {
+                rotAccounts[ri] = { ...dbAccount, ...acct, cookie: dbAccount.cookie, cookies: dbAccount.cookies, imei: dbAccount.imei || acct.imei, decryptKey: dbAccount.decryptKey || acct.decryptKey, commonParams: dbAccount.commonParams || acct.commonParams, UIN: dbAccount.UIN || acct.UIN, sessionSource: dbAccount.sessionSource || acct.sessionSource };
+              }
+            }
+          } catch (_) { /* skip enrichment errors */ }
+        }
+        body.accounts = rotAccounts;
+        return handleFriendRequestRotateStream(req, res, body);
       }
 
       if (req.method === 'POST' && url === '/api/zalo/groups/invite-targets') {
