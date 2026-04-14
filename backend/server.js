@@ -185,6 +185,8 @@ async function handleSendBatchStream(req, res, body) {
 async function handleFriendRequestBatchStream(req, res, body) {
   const account = body?.account;
   const jobs = Array.isArray(body?.jobs) ? body.jobs : [];
+  const messageTemplates = Array.isArray(body?.messageTemplates) ? body.messageTemplates : [];
+  const rotateMessageEvery = Math.max(1, parseInt(body?.rotateMessageEvery, 10) || 100);
 
   if (!account) {
     writeJson(res, 400, { ok: false, error: 'Thiếu account để gửi lời mời kết bạn.' });
@@ -231,11 +233,19 @@ async function handleFriendRequestBatchStream(req, res, body) {
 
   let accepted = 0;
   let failed = 0;
+  let templateIdx = 0;
+  let templateCounter = 0;
 
   for (let index = 0; index < jobs.length; index += 1) {
     const job = jobs[index];
     const userId = String(job?.zid || '').trim();
-    const note = String(job?.note || '').trim();
+    // Use rotating templates if provided, else job.note
+    let note;
+    if (messageTemplates.length > 0) {
+      note = String(messageTemplates[templateIdx % messageTemplates.length] || '').trim();
+    } else {
+      note = String(job?.note || '').trim();
+    }
     const startedAt = new Date().toISOString();
 
     writeNdjsonLine(res, {
@@ -291,6 +301,12 @@ async function handleFriendRequestBatchStream(req, res, body) {
           startedAt, failedAt: new Date().toISOString(), provider: 'server',
         });
       }
+    }
+
+    templateCounter++;
+    if (messageTemplates.length > 1 && templateCounter >= rotateMessageEvery) {
+      templateIdx++;
+      templateCounter = 0;
     }
 
     if (index < jobs.length - 1) {
