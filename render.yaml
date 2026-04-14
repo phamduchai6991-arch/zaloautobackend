@@ -17,3 +17,5 @@ services:
         sync: false
       - key: ZALOWEB_ALLOWED_ORIGINS
         sync: false
+      - key: SESSION_SECRET
+        sync: false
