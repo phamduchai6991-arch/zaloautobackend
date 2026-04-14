@@ -53,7 +53,7 @@ function readBody(req) {
 const TIER_RANK = { basic: 1, plus: 2, pro: 3 };
 const PLAN_LABELS = { basic: 'BASIC', plus: 'PLUS', pro: 'PRO' };
 
-export function handleCreateOrder(req, res, body) {
+export async function handleCreateOrder(req, res, body) {
   const { userId, userEmail, planKey, period } = body || {};
 
   if (!userId || !userEmail) {
@@ -67,7 +67,7 @@ export function handleCreateOrder(req, res, body) {
   }
 
   // ── Check current subscription: block downgrades ──
-  const currentSub = getSubscription(userId, userEmail);
+  const currentSub = await getSubscription(userId, userEmail);
   let discount = 0;          // prorated credit from current plan (VNĐ)
   let originalAmount = VALID_PLANS[planKey][period];
 
@@ -104,7 +104,7 @@ export function handleCreateOrder(req, res, body) {
   }
 
   const amount = Math.max(originalAmount - discount, 0);
-  const order = createOrder({ userId, userEmail, planKey, period, amount });
+  const order = await createOrder({ userId, userEmail, planKey, period, amount });
 
   writeJson(res, 200, {
     ok: true,
@@ -122,9 +122,9 @@ export function handleCreateOrder(req, res, body) {
   });
 }
 
-export function handleGetOrder(req, res, code) {
+export async function handleGetOrder(req, res, code) {
   if (!code) return writeJson(res, 400, { ok: false, error: 'Thiếu mã đơn hàng.' });
-  const order = getOrder(code);
+  const order = await getOrder(code);
   if (!order) return writeJson(res, 404, { ok: false, error: 'Đơn hàng không tồn tại.' });
 
   writeJson(res, 200, {
@@ -141,9 +141,9 @@ export function handleGetOrder(req, res, code) {
   });
 }
 
-export function handleGetUserOrders(req, res, userId) {
+export async function handleGetUserOrders(req, res, userId) {
   if (!userId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId.' });
-  const orders = getOrdersByUser(userId);
+  const orders = await getOrdersByUser(userId);
   writeJson(res, 200, {
     ok: true,
     orders: orders.map((o) => ({
@@ -154,11 +154,11 @@ export function handleGetUserOrders(req, res, userId) {
   });
 }
 
-export function handleGetSubscription(req, res, userId) {
+export async function handleGetSubscription(req, res, userId) {
   if (!userId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId.' });
   const requestUrl = new URL(req.url || '/', 'http://localhost');
   const userEmail = requestUrl.searchParams.get('email') || '';
-  const sub = getSubscription(userId, userEmail);
+  const sub = await getSubscription(userId, userEmail);
   writeJson(res, 200, {
     ok: true,
     subscription: sub
@@ -169,7 +169,7 @@ export function handleGetSubscription(req, res, userId) {
 
 // ─── SePay Webhook ───────────────────────────────────────
 
-export function handleSepayWebhook(req, res, body) {
+export async function handleSepayWebhook(req, res, body) {
   const authHeader = req.headers['authorization'] || '';
   const providedKey = authHeader.replace(/^Apikey\s+/i, '').trim();
 
@@ -189,7 +189,7 @@ export function handleSepayWebhook(req, res, body) {
     return writeJson(res, 200, { ok: true, message: 'Ignored: no transfer content.' });
   }
 
-  const order = findPendingOrderByCode(content);
+  const order = await findPendingOrderByCode(content);
   if (!order) {
     console.log(`[payment] No matching order for content: "${content}"`);
     return writeJson(res, 200, { ok: true, message: 'No matching order found.' });
@@ -200,19 +200,19 @@ export function handleSepayWebhook(req, res, body) {
     return writeJson(res, 200, { ok: true, message: 'Amount insufficient.' });
   }
 
-  const paidOrder = markOrderPaid(order.code, transactionId);
+  const paidOrder = await markOrderPaid(order.code, transactionId);
   if (!paidOrder) {
     return writeJson(res, 200, { ok: true, message: 'Order already processed.' });
   }
 
-  const sub = activateSubscription(paidOrder);
+  const sub = await activateSubscription(paidOrder);
   console.log(`[payment] ✓ Order ${paidOrder.code} paid. Plan: ${paidOrder.planKey}/${paidOrder.period}. User: ${paidOrder.userEmail}. Expires: ${sub.expiresAt}`);
 
   writeJson(res, 200, { ok: true, message: 'Payment confirmed.', orderCode: paidOrder.code });
 }
 
-export function cleanupExpiredOrders() {
-  const count = cancelExpiredOrders();
+export async function cleanupExpiredOrders() {
+  const count = await cancelExpiredOrders();
   if (count > 0) console.log(`[payment] Cleaned up ${count} expired orders.`);
 }
 
