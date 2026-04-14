@@ -109,7 +109,10 @@ async function handleSendBatchStream(req, res, body) {
   const rawFiles = Array.isArray(body?.files) ? body.files : [];
   const attachments = rawFiles
     .filter((f) => f && typeof f.name === 'string' && typeof f.data === 'string')
-    .map((f) => ({ data: Buffer.from(f.data, 'base64'), filename: f.name }));
+    .map((f) => {
+      const buf = Buffer.from(f.data, 'base64');
+      return { data: buf, filename: f.name, metadata: { totalSize: buf.length } };
+    });
 
   let accepted = 0;
   let failed = 0;
@@ -165,10 +168,15 @@ async function handleSendBatchStream(req, res, body) {
       const threadType = groupJob ? ThreadType.Group : ThreadType.User;
       const msgPayload = hasAttachments ? { msg: content, attachments } : content;
       const apiResult = await api.sendMessage(msgPayload, zid, threadType);
+
+      // Check if attachment uploads failed
+      const attachResults = Array.isArray(apiResult?.attachment) ? apiResult.attachment : [];
+      const attachFailed = hasAttachments && attachResults.length === 0;
+
       accepted++;
       writeNdjsonLine(res, {
         jobId: job.id, ok: true, status: 'sent',
-        statusLabel: 'Đã gửi',
+        statusLabel: attachFailed ? 'Đã gửi (tệp lỗi)' : 'Đã gửi',
         startedAt, sentAt: new Date().toISOString(), provider: 'server',
         apiResult,
       });
