@@ -34,6 +34,7 @@ import {
   handleGroupInviteTargets,
   handleActionBatch,
 } from '../service/lib/handlers.js';
+import { requireAuthenticatedGoogleUser } from './lib/googleAuth.js';
 import { createApiClient, getUserAgent } from '../service/lib/apiClient.js';
 import { isGroupJob, normalizeThreadId, getDelayMs, sleep } from '../service/lib/zaloHelpers.js';
 import { MuteAction, MuteDuration, ThreadType } from 'zalo-api-final';
@@ -672,6 +673,8 @@ const server = createServer(async (req, res) => {
       if (req.method === 'GET' && url === '/api/accounts') {
         const userId = fullUrl.searchParams.get('userId');
         if (!userId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId.' });
+        const principal = await requireAuthenticatedGoogleUser(req, res, userId);
+        if (!principal) return;
         const accounts = await getAccountsByUser(userId);
         return writeJson(res, 200, { ok: true, accounts });
       }
@@ -681,6 +684,8 @@ const server = createServer(async (req, res) => {
         const body = await readBody(req);
         const { userId, zaloId, zaloName, zaloAvatar, zaloPhone, accountData } = body || {};
         if (!userId || !zaloId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId hoặc zaloId.' });
+        const principal = await requireAuthenticatedGoogleUser(req, res, userId);
+        if (!principal) return;
         // Look up actual subscription server-side — don't trust client planKey
         const { getSubscription } = await import('./lib/paymentStore.js');
         const sub = await getSubscription(userId);
@@ -694,6 +699,8 @@ const server = createServer(async (req, res) => {
         const body = await readBody(req);
         const { userId, zaloId } = body || {};
         if (!userId || !zaloId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId hoặc zaloId.' });
+        const principal = await requireAuthenticatedGoogleUser(req, res, userId);
+        if (!principal) return;
         const removed = await removeAccount(userId, zaloId);
         return writeJson(res, 200, { ok: true, removed });
       }

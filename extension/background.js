@@ -1157,8 +1157,7 @@ const READ_ONLY_ZALO_METHODS = new Set([
 async function forwardZaloApiRequest(payload) {
   const account = payload?.account;
   const request = payload?.request;
-  const isReadOnly = READ_ONLY_ZALO_METHODS.has(request?.method);
-  const allowCreateTab = isReadOnly ? false : (payload?.options?.allowCreateTab !== false);
+  const allowCreateTab = payload?.options?.allowCreateTab !== false;
 
   if (!account) {
     return { ok: false, error: 'Không có thông tin tài khoản để gửi request Zalo.' };
