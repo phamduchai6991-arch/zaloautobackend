@@ -127,6 +127,10 @@ const PLAN_DURATION = {
   yearly: 365,
 };
 
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
 export async function activateSubscription(order) {
   const days = PLAN_DURATION[order.period] || 30;
   const now = new Date();
@@ -164,9 +168,32 @@ export async function activateSubscription(order) {
   return rowToSub(result.rows[0]);
 }
 
-export async function getSubscription(userId) {
-  const result = await query('SELECT * FROM subscriptions WHERE user_id = $1', [userId]);
-  const sub = rowToSub(result.rows[0]);
+export async function getSubscription(userId, userEmail = '') {
+  let result = await query('SELECT * FROM subscriptions WHERE user_id = $1', [userId]);
+  let sub = rowToSub(result.rows[0]);
+
+  if (!sub && normalizeEmail(userEmail)) {
+    const fallbackResult = await query(
+      'SELECT * FROM subscriptions WHERE LOWER(user_email) = LOWER($1) ORDER BY updated_at DESC NULLS LAST LIMIT 1',
+      [userEmail],
+    );
+    const legacySub = rowToSub(fallbackResult.rows[0]);
+    if (legacySub) {
+      if (legacySub.userId !== userId) {
+        const migrated = await query(
+          `UPDATE subscriptions
+           SET user_id = $2, user_email = COALESCE(NULLIF($3, ''), user_email), updated_at = $4
+           WHERE user_id = $1
+           RETURNING *`,
+          [legacySub.userId, userId, userEmail, new Date().toISOString()],
+        );
+        sub = rowToSub(migrated.rows[0]);
+      } else {
+        sub = legacySub;
+      }
+    }
+  }
+
   if (!sub) return null;
 
   // Auto-expire
