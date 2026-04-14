@@ -1082,6 +1082,8 @@ const server = createServer(async (req, res) => {
         const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || 'sk-6b3964ea846f4e1daabcf8f0c4000986';
         const systemPrompt = target === 'friend'
           ? 'Bạn là trợ lý viết lại tin nhắn kết bạn Zalo. Hãy viết lại nội dung sau thành 3 phiên bản khác nhau: 1 bản lịch sự chuyên nghiệp, 1 bản thân thiện gần gũi, 1 bản ngắn gọn súc tích. Mỗi bản tối đa 150 ký tự. Trả về JSON array gồm 3 string, không giải thích thêm.'
+          : target === 'rotation'
+          ? 'Bạn là trợ lý tạo mẫu tin nhắn kết bạn Zalo để luân phiên sử dụng (chống spam). Dựa trên nội dung gốc, hãy tạo 5 phiên bản khác nhau nhưng cùng ý nghĩa: mỗi bản có cách diễn đạt, phong cách, cấu trúc câu khác nhau để tránh bị hệ thống phát hiện spam. Mỗi bản tối đa 150 ký tự. Trả về JSON array gồm 5 string, không giải thích thêm.'
           : 'Bạn là trợ lý viết lại tin nhắn Zalo. Hãy viết lại nội dung sau thành 3 phiên bản khác nhau: 1 bản lịch sự chuyên nghiệp, 1 bản thân thiện gần gũi, 1 bản ngắn gọn súc tích. Trả về JSON array gồm 3 string, không giải thích thêm.';
         try {
           const resp = await fetch('https://api.deepseek.com/chat/completions', {
