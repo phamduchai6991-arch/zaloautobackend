@@ -21,6 +21,14 @@ import {
 } from './lib/adminHandlers.js';
 import { handleSyncUser } from './lib/userHandlers.js';
 import {
+  getNotifications,
+  getUnreadCount,
+  markAllRead,
+  markRead,
+  checkExpiringSubscriptions,
+  ensureNotificationSchema,
+} from './lib/notificationStore.js';
+import {
   getAccount,
   getAccountsByUser,
   registerAccount,
@@ -918,6 +926,37 @@ const server = createServer(async (req, res) => {
         return handleSepayWebhook(req, res, body);
       }
 
+      // ─── Notification routes ─────────────────────
+
+      const notifMatch = url.match(/^\/api\/notifications\/([^/]+)$/);
+      if (req.method === 'GET' && notifMatch) {
+        const userId = decodeURIComponent(notifMatch[1]);
+        const notifications = await getNotifications(userId);
+        const unread = await getUnreadCount(userId);
+        return writeJson(res, 200, { ok: true, notifications, unread });
+      }
+
+      const notifCountMatch = url.match(/^\/api\/notifications\/([^/]+)\/count$/);
+      if (req.method === 'GET' && notifCountMatch) {
+        const userId = decodeURIComponent(notifCountMatch[1]);
+        const unread = await getUnreadCount(userId);
+        return writeJson(res, 200, { ok: true, unread });
+      }
+
+      if (req.method === 'POST' && url === '/api/notifications/read-all') {
+        const body = await readBody(req);
+        if (!body?.userId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId.' });
+        await markAllRead(body.userId);
+        return writeJson(res, 200, { ok: true });
+      }
+
+      if (req.method === 'POST' && url === '/api/notifications/read') {
+        const body = await readBody(req);
+        if (!body?.userId || !body?.id) return writeJson(res, 400, { ok: false, error: 'Thiếu userId hoặc id.' });
+        await markRead(body.userId, body.id);
+        return writeJson(res, 200, { ok: true });
+      }
+
       if (req.method === 'POST' && url === '/api/admin/login') {
         const body = await readBody(req);
         return handleAdminLogin(req, res, body);
@@ -1182,6 +1221,12 @@ server.listen(PORT, () => {
 
   // Cleanup expired orders every hour
   setInterval(cleanupExpiredOrders, 60 * 60 * 1000);
+
+  // Check for expiring subscriptions and send notifications (every 6 hours)
+  ensureNotificationSchema().then(() => {
+    checkExpiringSubscriptions().catch(() => {});
+    setInterval(() => checkExpiringSubscriptions().catch(() => {}), 6 * 60 * 60 * 1000);
+  }).catch(() => {});
 });
 
 server.on('error', (error) => {

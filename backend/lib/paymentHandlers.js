@@ -8,6 +8,7 @@ import {
   activateSubscription,
   cancelExpiredOrders,
 } from './paymentStore.js';
+import { notifySubscriptionActivated } from './notificationStore.js';
 
 // ─── Config ──────────────────────────────────────────────
 
@@ -215,6 +216,13 @@ export async function handleSepayWebhook(req, res, body) {
 
   const sub = await activateSubscription(paidOrder);
   console.log(`[payment] ✓ Order ${paidOrder.code} paid. Plan: ${paidOrder.planKey}/${paidOrder.period}. User: ${paidOrder.userEmail}. Expires: ${sub.expiresAt}`);
+
+  // Create notification for the user
+  try {
+    await notifySubscriptionActivated(paidOrder.userId, paidOrder.planKey, paidOrder.period, sub.expiresAt);
+  } catch (notifErr) {
+    console.warn('[payment] Failed to create notification:', notifErr.message);
+  }
 
   writeJson(res, 200, { ok: true, message: 'Payment confirmed.', orderCode: paidOrder.code });
 }
