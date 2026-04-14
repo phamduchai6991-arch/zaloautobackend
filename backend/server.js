@@ -35,7 +35,7 @@ import {
   handleGroupInviteTargets,
   handleActionBatch,
 } from '../service/lib/handlers.js';
-import { requireAuthenticatedGoogleUser } from './lib/googleAuth.js';
+import { requireAuthenticatedGoogleUser, createSessionToken, verifyGoogleIdToken, verifyGoogleAccessToken } from './lib/googleAuth.js';
 import { createApiClient, getUserAgent } from '../service/lib/apiClient.js';
 import { isGroupJob, normalizeThreadId, getDelayMs, sleep } from '../service/lib/zaloHelpers.js';
 import { MuteAction, MuteDuration, ThreadType } from 'zalo-api-final';
@@ -57,6 +57,31 @@ async function handleSendBatchStream(req, res, body) {
   if (!jobs.length) {
     writeJson(res, 400, { ok: false, error: 'Danh sách jobs rỗng.' });
     return;
+  }
+
+  // Enrich account from DB if frontend sent incomplete session data
+  try {
+    const hasCookies = Boolean(
+      (Array.isArray(account?.cookies) && account.cookies.length > 0) ||
+      (typeof account?.cookie === 'string' && account.cookie.trim()),
+    );
+    if (!hasCookies && account.ownerUserId && (account.id || account.zaloId || account.userId)) {
+      const zaloId = account.id || account.zaloId || account.userId;
+      const dbAccount = await getAccount(account.ownerUserId, zaloId);
+      if (dbAccount) {
+        Object.assign(account, {
+          cookie: dbAccount.cookie,
+          cookies: dbAccount.cookies,
+          imei: dbAccount.imei || account.imei,
+          decryptKey: dbAccount.decryptKey || account.decryptKey,
+          commonParams: dbAccount.commonParams || account.commonParams,
+          UIN: dbAccount.UIN || account.UIN,
+          sessionSource: dbAccount.sessionSource || account.sessionSource,
+        });
+      }
+    }
+  } catch (enrichErr) {
+    console.warn('[backend] Account enrichment for messages/batch failed:', enrichErr.message);
   }
 
   const userAgent = getUserAgent(body, req);
@@ -624,6 +649,38 @@ const server = createServer(async (req, res) => {
         return writeJson(res, 200, { ok: true, service: 'autozalo-backend' });
       }
 
+      // ─── Session token exchange ───────────────────
+      // Frontend sends a short-lived Google token, gets back a long-lived session token (30 days).
+      if (req.method === 'POST' && url === '/api/auth/session') {
+        const body = await readBody(req);
+        const googleToken = body?.googleToken || '';
+        const googleAuthType = body?.googleAuthType || 'google-id-token';
+
+        if (!googleToken) {
+          return writeJson(res, 400, { ok: false, error: 'Thiếu googleToken.' });
+        }
+
+        try {
+          const principal = googleAuthType === 'google-access-token'
+            ? await verifyGoogleAccessToken(googleToken)
+            : await verifyGoogleIdToken(googleToken);
+
+          const session = createSessionToken(principal.sub, principal.email);
+          return writeJson(res, 200, {
+            ok: true,
+            sessionToken: session.token,
+            expiresAt: session.expiresAt,
+            sub: principal.sub,
+            email: principal.email,
+          });
+        } catch (error) {
+          return writeJson(res, 401, {
+            ok: false,
+            error: error instanceof Error ? error.message : 'Xác thực Google thất bại.',
+          });
+        }
+      }
+
       if (req.method === 'POST' && url === '/api/payment/create-order') {
         const body = await readBody(req);
         return handleCreateOrder(req, res, body);
@@ -718,6 +775,23 @@ const server = createServer(async (req, res) => {
 
       if (req.method === 'POST' && url === '/api/zalo/account/sync') {
         const body = await readBody(req);
+        // Enrich account from DB if frontend sent incomplete session data
+        try {
+          const acct = body?.account;
+          const hasCookies = Boolean(
+            (Array.isArray(acct?.cookies) && acct.cookies.length > 0) ||
+            (typeof acct?.cookie === 'string' && acct.cookie.trim()),
+          );
+          if (acct && !hasCookies && acct.ownerUserId && (acct.id || acct.zaloId || acct.userId)) {
+            const zaloId = acct.id || acct.zaloId || acct.userId;
+            const dbAccount = await getAccount(acct.ownerUserId, zaloId);
+            if (dbAccount) {
+              body.account = { ...dbAccount, ...acct, cookie: dbAccount.cookie, cookies: dbAccount.cookies, imei: dbAccount.imei || acct.imei, decryptKey: dbAccount.decryptKey || acct.decryptKey, commonParams: dbAccount.commonParams || acct.commonParams, UIN: dbAccount.UIN || acct.UIN, sessionSource: dbAccount.sessionSource || acct.sessionSource };
+            }
+          }
+        } catch (enrichErr) {
+          console.warn('[backend] Account enrichment for account/sync failed:', enrichErr.message);
+        }
         return handleAccountSync(req, res, body);
       }
 
