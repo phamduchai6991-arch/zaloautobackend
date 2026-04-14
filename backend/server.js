@@ -679,13 +679,13 @@ const server = createServer(async (req, res) => {
       // POST /api/accounts/register — register a Zalo account for a user
       if (req.method === 'POST' && url === '/api/accounts/register') {
         const body = await readBody(req);
-        const { userId, zaloId, zaloName, zaloAvatar, zaloPhone } = body || {};
+        const { userId, zaloId, zaloName, zaloAvatar, zaloPhone, accountData } = body || {};
         if (!userId || !zaloId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId hoặc zaloId.' });
         // Look up actual subscription server-side — don't trust client planKey
         const { getSubscription } = await import('./lib/paymentStore.js');
         const sub = await getSubscription(userId);
         const planKey = (sub?.status === 'active' ? sub.planKey : null) || 'basic';
-        const result = await registerAccount({ userId, planKey, zaloId, zaloName, zaloAvatar, zaloPhone });
+        const result = await registerAccount({ userId, planKey, zaloId, zaloName, zaloAvatar, zaloPhone, accountData });
         return writeJson(res, result.ok ? 200 : 403, result);
       }
 
