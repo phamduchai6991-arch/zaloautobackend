@@ -170,6 +170,14 @@ export async function handleGetSubscription(req, res, userId) {
 // ─── SePay Webhook ───────────────────────────────────────
 
 export async function handleSepayWebhook(req, res, body) {
+  console.log(`[payment] Webhook received:`, JSON.stringify({
+    transferType: body?.transferType,
+    transferAmount: body?.transferAmount,
+    content: body?.content,
+    accountNumber: body?.accountNumber,
+    id: body?.id,
+  }));
+
   const authHeader = req.headers['authorization'] || '';
   const providedKey = authHeader.replace(/^Apikey\s+/i, '').trim();
 
