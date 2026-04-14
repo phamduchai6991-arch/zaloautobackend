@@ -50,7 +50,10 @@ function readBody(req) {
 
 // ─── Handlers ────────────────────────────────────────────
 
-export async function handleCreateOrder(req, res, body) {
+const TIER_RANK = { basic: 1, plus: 2, pro: 3 };
+const PLAN_LABELS = { basic: 'BASIC', plus: 'PLUS', pro: 'PRO' };
+
+export function handleCreateOrder(req, res, body) {
   const { userId, userEmail, planKey, period } = body || {};
 
   if (!userId || !userEmail) {
@@ -63,8 +66,45 @@ export async function handleCreateOrder(req, res, body) {
     return writeJson(res, 400, { ok: false, error: 'Chu kỳ không hợp lệ (monthly/yearly).' });
   }
 
-  const amount = VALID_PLANS[planKey][period];
-  const order = await createOrder({ userId, userEmail, planKey, period, amount });
+  // ── Check current subscription: block downgrades ──
+  const currentSub = getSubscription(userId, userEmail);
+  let discount = 0;          // prorated credit from current plan (VNĐ)
+  let originalAmount = VALID_PLANS[planKey][period];
+
+  if (currentSub && currentSub.status === 'active' && new Date(currentSub.expiresAt) > new Date()) {
+    const currentRank = TIER_RANK[currentSub.planKey] ?? 0;
+    const newRank = TIER_RANK[planKey] ?? 0;
+
+    // Block downgrade
+    if (newRank < currentRank) {
+      return writeJson(res, 400, {
+        ok: false,
+        error: `Bạn đang dùng gói ${PLAN_LABELS[currentSub.planKey]}. Không thể mua gói thấp hơn. Hãy chọn gói ${PLAN_LABELS[currentSub.planKey]} hoặc cao hơn.`,
+      });
+    }
+
+    // Same plan → allow renewal (no discount)
+    // Upgrade → calculate prorated credit for remaining days
+    if (newRank > currentRank) {
+      const now = Date.now();
+      const expiresAt = new Date(currentSub.expiresAt).getTime();
+      const startedAt = new Date(currentSub.startedAt).getTime();
+      const totalDuration = expiresAt - startedAt;
+      const remaining = expiresAt - now;
+
+      if (totalDuration > 0 && remaining > 0) {
+        const remainingRatio = remaining / totalDuration;
+        // How much the user originally paid for the current plan
+        const currentPlanPrice = VALID_PLANS[currentSub.planKey]
+          ? (VALID_PLANS[currentSub.planKey][period] || VALID_PLANS[currentSub.planKey]['monthly'])
+          : 0;
+        discount = Math.round(currentPlanPrice * remainingRatio);
+      }
+    }
+  }
+
+  const amount = Math.max(originalAmount - discount, 0);
+  const order = createOrder({ userId, userEmail, planKey, period, amount });
 
   writeJson(res, 200, {
     ok: true,
@@ -78,12 +118,13 @@ export async function handleCreateOrder(req, res, body) {
     },
     bank: BANK_INFO,
     transferContent: order.code,
+    upgrade: discount > 0 ? { originalAmount, discount, finalAmount: amount } : null,
   });
 }
 
-export async function handleGetOrder(req, res, code) {
+export function handleGetOrder(req, res, code) {
   if (!code) return writeJson(res, 400, { ok: false, error: 'Thiếu mã đơn hàng.' });
-  const order = await getOrder(code);
+  const order = getOrder(code);
   if (!order) return writeJson(res, 404, { ok: false, error: 'Đơn hàng không tồn tại.' });
 
   writeJson(res, 200, {
@@ -100,9 +141,9 @@ export async function handleGetOrder(req, res, code) {
   });
 }
 
-export async function handleGetUserOrders(req, res, userId) {
+export function handleGetUserOrders(req, res, userId) {
   if (!userId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId.' });
-  const orders = await getOrdersByUser(userId);
+  const orders = getOrdersByUser(userId);
   writeJson(res, 200, {
     ok: true,
     orders: orders.map((o) => ({
@@ -113,11 +154,11 @@ export async function handleGetUserOrders(req, res, userId) {
   });
 }
 
-export async function handleGetSubscription(req, res, userId) {
+export function handleGetSubscription(req, res, userId) {
   if (!userId) return writeJson(res, 400, { ok: false, error: 'Thiếu userId.' });
   const requestUrl = new URL(req.url || '/', 'http://localhost');
   const userEmail = requestUrl.searchParams.get('email') || '';
-  const sub = await getSubscription(userId, userEmail);
+  const sub = getSubscription(userId, userEmail);
   writeJson(res, 200, {
     ok: true,
     subscription: sub
@@ -128,7 +169,7 @@ export async function handleGetSubscription(req, res, userId) {
 
 // ─── SePay Webhook ───────────────────────────────────────
 
-export async function handleSepayWebhook(req, res, body) {
+export function handleSepayWebhook(req, res, body) {
   const authHeader = req.headers['authorization'] || '';
   const providedKey = authHeader.replace(/^Apikey\s+/i, '').trim();
 
@@ -148,7 +189,7 @@ export async function handleSepayWebhook(req, res, body) {
     return writeJson(res, 200, { ok: true, message: 'Ignored: no transfer content.' });
   }
 
-  const order = await findPendingOrderByCode(content);
+  const order = findPendingOrderByCode(content);
   if (!order) {
     console.log(`[payment] No matching order for content: "${content}"`);
     return writeJson(res, 200, { ok: true, message: 'No matching order found.' });
@@ -159,19 +200,19 @@ export async function handleSepayWebhook(req, res, body) {
     return writeJson(res, 200, { ok: true, message: 'Amount insufficient.' });
   }
 
-  const paidOrder = await markOrderPaid(order.code, transactionId);
+  const paidOrder = markOrderPaid(order.code, transactionId);
   if (!paidOrder) {
     return writeJson(res, 200, { ok: true, message: 'Order already processed.' });
   }
 
-  const sub = await activateSubscription(paidOrder);
+  const sub = activateSubscription(paidOrder);
   console.log(`[payment] ✓ Order ${paidOrder.code} paid. Plan: ${paidOrder.planKey}/${paidOrder.period}. User: ${paidOrder.userEmail}. Expires: ${sub.expiresAt}`);
 
   writeJson(res, 200, { ok: true, message: 'Payment confirmed.', orderCode: paidOrder.code });
 }
 
-export async function cleanupExpiredOrders() {
-  const count = await cancelExpiredOrders();
+export function cleanupExpiredOrders() {
+  const count = cancelExpiredOrders();
   if (count > 0) console.log(`[payment] Cleaned up ${count} expired orders.`);
 }
 

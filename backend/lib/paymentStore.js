@@ -1,41 +1,52 @@
-import { query } from './db.js';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-// ─── Helpers ─────────────────────────────────────────────
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = join(__dirname, '..', 'data');
+const ORDERS_FILE = join(DATA_DIR, 'orders.json');
+const SUBSCRIPTIONS_FILE = join(DATA_DIR, 'subscriptions.json');
 
-function rowToOrder(row) {
-  if (!row) return null;
-  return {
-    code: row.code,
-    userId: row.user_id,
-    userEmail: row.user_email,
-    planKey: row.plan_key,
-    period: row.period,
-    amount: row.amount,
-    status: row.status,
-    createdAt: row.created_at?.toISOString?.() || row.created_at,
-    paidAt: row.paid_at?.toISOString?.() || row.paid_at || null,
-    transactionId: row.transaction_id || null,
-    source: row.source || undefined,
-  };
+function ensureDataDir() {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 }
 
-function rowToSub(row) {
-  if (!row) return null;
-  return {
-    userId: row.user_id,
-    userEmail: row.user_email,
-    planKey: row.plan_key,
-    status: row.status,
-    startedAt: row.started_at?.toISOString?.() || row.started_at,
-    expiresAt: row.expires_at?.toISOString?.() || row.expires_at,
-    updatedAt: row.updated_at?.toISOString?.() || row.updated_at,
-    lastOrderCode: row.last_order_code || null,
-  };
+function loadJson(filePath) {
+  try {
+    if (!existsSync(filePath)) return {};
+    return JSON.parse(readFileSync(filePath, 'utf-8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveJson(filePath, data) {
+  ensureDataDir();
+  writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+}
+
+// ─── Orders ──────────────────────────────────────────────
+
+let _orders = null;
+
+function getOrders() {
+  if (!_orders) _orders = loadJson(ORDERS_FILE);
+  return _orders;
+}
+
+function saveOrders() {
+  saveJson(ORDERS_FILE, _orders);
+}
+
+function isExpiredPendingOrder(order, maxAgeMs = 24 * 60 * 60 * 1000) {
+  if (!order || order.status !== 'pending') return false;
+  return Date.now() - new Date(order.createdAt).getTime() > maxAgeMs;
 }
 
 let _orderCounter = 0;
 
 function generateOrderCode() {
+  // Use last 5 chars of timestamp + random char + counter for uniqueness across restarts
   const ts = Date.now().toString(36).toUpperCase().slice(-5);
   const rand = Math.random().toString(36).toUpperCase().slice(-1);
   _orderCounter = (_orderCounter + 1) % 100;
@@ -49,78 +60,106 @@ function generateAdminOrderCode() {
   return `ADM${ts}${rand}${_orderCounter.toString().padStart(2, '0')}`;
 }
 
-// ─── Orders ──────────────────────────────────────────────
-
-export async function createOrder({ userId, userEmail, planKey, period, amount }) {
+export function createOrder({ userId, userEmail, planKey, period, amount }) {
+  const orders = getOrders();
   const code = generateOrderCode();
-  const now = new Date().toISOString();
 
-  const result = await query(
-    `INSERT INTO orders (code, user_id, user_email, plan_key, period, amount, status, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
-     RETURNING *`,
-    [code, userId, userEmail, planKey, period, amount, now],
-  );
+  const order = {
+    code,
+    userId,
+    userEmail,
+    planKey,
+    period,
+    amount,
+    status: 'pending',
+    createdAt: new Date().toISOString(),
+    paidAt: null,
+    transactionId: null,
+  };
 
-  return rowToOrder(result.rows[0]);
+  orders[code] = order;
+  _orders = orders;
+  saveOrders();
+  return order;
 }
 
-export async function getOrder(code) {
-  const result = await query('SELECT * FROM orders WHERE code = $1', [code]);
-  const order = rowToOrder(result.rows[0]);
+export function getOrder(code) {
+  const orders = getOrders();
+  const order = orders[code] || null;
   if (!order) return null;
 
-  // Auto-expire pending orders older than 24h
-  if (order.status === 'pending' && Date.now() - new Date(order.createdAt).getTime() > 24 * 60 * 60 * 1000) {
-    await query("UPDATE orders SET status = 'expired' WHERE code = $1 AND status = 'pending'", [code]);
+  if (isExpiredPendingOrder(order)) {
     order.status = 'expired';
+    _orders = orders;
+    saveOrders();
   }
 
   return order;
 }
 
-export async function getOrdersByUser(userId) {
-  const result = await query(
-    'SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC',
-    [userId],
-  );
-  return result.rows.map(rowToOrder);
+export function getOrdersByUser(userId) {
+  const orders = getOrders();
+  return Object.values(orders)
+    .filter((o) => o.userId === userId)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
-export async function markOrderPaid(code, transactionId) {
-  const now = new Date().toISOString();
-  const result = await query(
-    `UPDATE orders SET status = 'paid', paid_at = $2, transaction_id = $3
-     WHERE code = $1 AND status = 'pending'
-     RETURNING *`,
-    [code, now, transactionId],
-  );
-  return rowToOrder(result.rows[0]);
+export function markOrderPaid(code, transactionId) {
+  const orders = getOrders();
+  const order = orders[code];
+  if (!order || order.status !== 'pending') return null;
+
+  order.status = 'paid';
+  order.paidAt = new Date().toISOString();
+  order.transactionId = transactionId;
+  _orders = orders;
+  saveOrders();
+  return order;
 }
 
-export async function findPendingOrderByCode(transferContent) {
+export function findPendingOrderByCode(transferContent) {
+  const orders = getOrders();
   const normalized = (transferContent || '').toUpperCase().replace(/\s+/g, '');
-  const result = await query("SELECT * FROM orders WHERE status = 'pending'");
 
-  for (const row of result.rows) {
-    if (normalized.includes(row.code.toUpperCase())) {
-      return rowToOrder(row);
-    }
+  for (const [code, order] of Object.entries(orders)) {
+    if (order.status !== 'pending') continue;
+    if (normalized.includes(code.toUpperCase())) return order;
   }
   return null;
 }
 
-export async function cancelExpiredOrders(maxAgeMs = 24 * 60 * 60 * 1000) {
-  const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-  const result = await query(
-    `UPDATE orders SET status = 'expired'
-     WHERE status = 'pending' AND created_at < $1`,
-    [cutoff],
-  );
-  return result.rowCount || 0;
+export function cancelExpiredOrders(maxAgeMs = 24 * 60 * 60 * 1000) {
+  const orders = getOrders();
+  const now = Date.now();
+  let count = 0;
+
+  for (const order of Object.values(orders)) {
+    if (order.status !== 'pending') continue;
+    if (now - new Date(order.createdAt).getTime() > maxAgeMs) {
+      order.status = 'expired';
+      count++;
+    }
+  }
+
+  if (count > 0) {
+    _orders = orders;
+    saveOrders();
+  }
+  return count;
 }
 
 // ─── Subscriptions ───────────────────────────────────────
+
+let _subs = null;
+
+function getSubs() {
+  if (!_subs) _subs = loadJson(SUBSCRIPTIONS_FILE);
+  return _subs;
+}
+
+function saveSubs() {
+  saveJson(SUBSCRIPTIONS_FILE, _subs);
+}
 
 const PLAN_DURATION = {
   monthly: 30,
@@ -131,101 +170,131 @@ function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
 }
 
-export async function activateSubscription(order) {
+export function activateSubscription(order) {
+  const subs = getSubs();
   const days = PLAN_DURATION[order.period] || 30;
-  const now = new Date();
-  const tierRank = { basic: 1, plus: 2, pro: 3 };
+  const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
 
-  // Check existing subscription
-  const existing = await query('SELECT * FROM subscriptions WHERE user_id = $1', [order.userId]);
-  const oldSub = existing.rows[0] ? rowToSub(existing.rows[0]) : null;
+  const existing = subs[order.userId];
 
-  if (oldSub && oldSub.status === 'active' && new Date(oldSub.expiresAt) > now) {
+  if (existing && existing.status === 'active' && new Date(existing.expiresAt) > new Date()) {
+    const tierRank = { basic: 1, plus: 2, pro: 3 };
     const newRank = tierRank[order.planKey] ?? 0;
-    const oldRank = tierRank[oldSub.planKey] ?? 0;
-    const currentEnd = new Date(oldSub.expiresAt);
-    const newExpiry = new Date(currentEnd.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
-    const newPlan = newRank >= oldRank ? order.planKey : oldSub.planKey;
+    const oldRank = tierRank[existing.planKey] ?? 0;
 
-    const result = await query(
-      `UPDATE subscriptions SET plan_key = $2, expires_at = $3, updated_at = $4, last_order_code = $5
-       WHERE user_id = $1
-       RETURNING *`,
-      [order.userId, newPlan, newExpiry, now.toISOString(), order.code],
-    );
-    return rowToSub(result.rows[0]);
+    if (newRank >= oldRank) {
+      if (newRank > oldRank) {
+        // Upgrade: credit was already deducted at order time, start fresh period
+        existing.planKey = order.planKey;
+        existing.startedAt = new Date().toISOString();
+        existing.expiresAt = expiresAt;
+        existing.updatedAt = new Date().toISOString();
+        existing.lastOrderCode = order.code;
+        _subs = subs;
+        saveSubs();
+        return existing;
+      }
+      // Same plan renewal: stack time on top of current expiry
+      existing.planKey = order.planKey;
+      const currentEnd = new Date(existing.expiresAt);
+      existing.expiresAt = new Date(currentEnd.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+      existing.updatedAt = new Date().toISOString();
+      existing.lastOrderCode = order.code;
+      _subs = subs;
+      saveSubs();
+      return existing;
+    } else {
+      // Downgrade: chỉ cộng thêm ngày, giữ nguyên tier hiện tại (tier cao hơn)
+      const currentEnd = new Date(existing.expiresAt);
+      existing.expiresAt = new Date(currentEnd.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+      existing.updatedAt = new Date().toISOString();
+      existing.lastOrderCode = order.code;
+      _subs = subs;
+      saveSubs();
+      return existing;
+    }
   }
 
-  const expiresAt = new Date(now.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
-  const result = await query(
-    `INSERT INTO subscriptions (user_id, user_email, plan_key, status, started_at, expires_at, updated_at, last_order_code)
-     VALUES ($1, $2, $3, 'active', $4, $5, $4, $6)
-     ON CONFLICT (user_id) DO UPDATE SET
-       user_email = $2, plan_key = $3, status = 'active', started_at = $4, expires_at = $5, updated_at = $4, last_order_code = $6
-     RETURNING *`,
-    [order.userId, order.userEmail, order.planKey, now.toISOString(), expiresAt, order.code],
-  );
-  return rowToSub(result.rows[0]);
+  const sub = {
+    userId: order.userId,
+    userEmail: order.userEmail,
+    planKey: order.planKey,
+    status: 'active',
+    startedAt: new Date().toISOString(),
+    expiresAt,
+    updatedAt: new Date().toISOString(),
+    lastOrderCode: order.code,
+  };
+
+  subs[order.userId] = sub;
+  _subs = subs;
+  saveSubs();
+  return sub;
 }
 
-export async function getSubscription(userId, userEmail = '') {
-  let result = await query('SELECT * FROM subscriptions WHERE user_id = $1', [userId]);
-  let sub = rowToSub(result.rows[0]);
+export function getSubscription(userId, userEmail = '') {
+  const subs = getSubs();
+  let sub = subs[userId];
 
   if (!sub && normalizeEmail(userEmail)) {
-    const fallbackResult = await query(
-      'SELECT * FROM subscriptions WHERE LOWER(user_email) = LOWER($1) ORDER BY updated_at DESC NULLS LAST LIMIT 1',
-      [userEmail],
-    );
-    const legacySub = rowToSub(fallbackResult.rows[0]);
-    if (legacySub) {
-      if (legacySub.userId !== userId) {
-        const migrated = await query(
-          `UPDATE subscriptions
-           SET user_id = $2, user_email = COALESCE(NULLIF($3, ''), user_email), updated_at = $4
-           WHERE user_id = $1
-           RETURNING *`,
-          [legacySub.userId, userId, userEmail, new Date().toISOString()],
-        );
-        sub = rowToSub(migrated.rows[0]);
-      } else {
-        sub = legacySub;
-      }
+    const fallbackEntry = Object.entries(subs).find(([, candidate]) => normalizeEmail(candidate?.userEmail) === normalizeEmail(userEmail));
+    if (fallbackEntry) {
+      const [oldKey, legacySub] = fallbackEntry;
+      sub = {
+        ...legacySub,
+        userId,
+        userEmail: legacySub.userEmail || userEmail,
+        updatedAt: new Date().toISOString(),
+      };
+      subs[userId] = sub;
+      if (oldKey !== userId) delete subs[oldKey];
+      _subs = subs;
+      saveSubs();
     }
   }
 
   if (!sub) return null;
 
-  // Auto-expire
   if (sub.status === 'active' && new Date(sub.expiresAt) < new Date()) {
-    await query("UPDATE subscriptions SET status = 'expired' WHERE user_id = $1", [userId]);
     sub.status = 'expired';
+    _subs = subs;
+    saveSubs();
   }
 
   return sub;
 }
 
-export async function getAllSubscriptions() {
-  const result = await query('SELECT * FROM subscriptions');
-  return result.rows.map(rowToSub);
+export function getAllSubscriptions() {
+  return Object.values(getSubs());
 }
 
-export async function getAllOrders() {
-  const result = await query('SELECT * FROM orders ORDER BY created_at DESC');
-  return result.rows.map(rowToOrder);
+export function getAllOrders() {
+  return Object.values(getOrders());
 }
 
-export async function grantAdminSubscription({ userId, userEmail, planKey, period, adminUsername = 'admin' }) {
+export function grantAdminSubscription({ userId, userEmail, planKey, period, adminUsername = 'admin' }) {
+  const orders = getOrders();
   const now = new Date().toISOString();
   const code = generateAdminOrderCode();
 
-  await query(
-    `INSERT INTO orders (code, user_id, user_email, plan_key, period, amount, status, created_at, paid_at, transaction_id, source)
-     VALUES ($1, $2, $3, $4, $5, 0, 'paid', $6, $6, $7, 'admin')`,
-    [code, userId, userEmail, planKey, period, now, `admin:${adminUsername}`],
-  );
+  const order = {
+    code,
+    userId,
+    userEmail,
+    planKey,
+    period,
+    amount: 0,
+    status: 'paid',
+    createdAt: now,
+    paidAt: now,
+    transactionId: `admin:${adminUsername}`,
+    source: 'admin',
+  };
 
-  const order = { code, userId, userEmail, planKey, period, amount: 0, status: 'paid', createdAt: now, paidAt: now, transactionId: `admin:${adminUsername}`, source: 'admin' };
-  const subscription = await activateSubscription(order);
+  orders[code] = order;
+  _orders = orders;
+  saveOrders();
+
+  const subscription = activateSubscription(order);
   return { order, subscription };
 }
