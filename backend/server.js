@@ -18,6 +18,15 @@ import {
   handleAdminOrders,
   handleAdminLogin,
   handleAdminGrantSubscription,
+  handleAdminListCategories,
+  handleAdminCreateCategory,
+  handleAdminUpdateCategory,
+  handleAdminDeleteCategory,
+  handleAdminListGroups,
+  handleAdminBulkAddGroups,
+  handleAdminUpdateGroup,
+  handleAdminDeleteGroup,
+  handleAdminGroupLibraryStats,
 } from './lib/adminHandlers.js';
 import { handleSyncUser } from './lib/userHandlers.js';
 import {
@@ -28,6 +37,11 @@ import {
   checkExpiringSubscriptions,
   ensureNotificationSchema,
 } from './lib/notificationStore.js';
+import {
+  listCategories as publicListCategories,
+  listGroups as publicListGroups,
+  ensureGroupLibrarySchema,
+} from './lib/groupLibraryStore.js';
 import {
   getAccount,
   getAccountsByUser,
@@ -979,6 +993,66 @@ const server = createServer(async (req, res) => {
         return handleAdminGrantSubscription(req, res, body);
       }
 
+      // ─── Group Library Admin ───
+
+      if (req.method === 'GET' && url === '/api/admin/group-library/stats') {
+        return handleAdminGroupLibraryStats(req, res);
+      }
+
+      if (req.method === 'GET' && url === '/api/admin/group-library/categories') {
+        return handleAdminListCategories(req, res);
+      }
+
+      if (req.method === 'POST' && url === '/api/admin/group-library/categories') {
+        const body = await readBody(req);
+        return handleAdminCreateCategory(req, res, body);
+      }
+
+      if (req.method === 'PUT' && url === '/api/admin/group-library/categories') {
+        const body = await readBody(req);
+        return handleAdminUpdateCategory(req, res, body);
+      }
+
+      if (req.method === 'DELETE' && url === '/api/admin/group-library/categories') {
+        const body = await readBody(req);
+        return handleAdminDeleteCategory(req, res, body);
+      }
+
+      if (req.method === 'GET' && url === '/api/admin/group-library/groups') {
+        const categoryId = fullUrl.searchParams.get('categoryId') || undefined;
+        const search = fullUrl.searchParams.get('search') || undefined;
+        return handleAdminListGroups(req, res, { categoryId, search });
+      }
+
+      if (req.method === 'POST' && url === '/api/admin/group-library/groups') {
+        const body = await readBody(req);
+        return handleAdminBulkAddGroups(req, res, body);
+      }
+
+      if (req.method === 'PUT' && url === '/api/admin/group-library/groups') {
+        const body = await readBody(req);
+        return handleAdminUpdateGroup(req, res, body);
+      }
+
+      if (req.method === 'DELETE' && url === '/api/admin/group-library/groups') {
+        const body = await readBody(req);
+        return handleAdminDeleteGroup(req, res, body);
+      }
+
+      // ─── Public Group Library ───
+
+      if (req.method === 'GET' && url === '/api/group-library/categories') {
+        const categories = await publicListCategories();
+        return writeJson(res, 200, { ok: true, categories });
+      }
+
+      if (req.method === 'GET' && url === '/api/group-library/groups') {
+        const categoryId = fullUrl.searchParams.get('categoryId') || undefined;
+        const search = fullUrl.searchParams.get('search') || undefined;
+        const groups = await publicListGroups({ categoryId, search });
+        return writeJson(res, 200, { ok: true, groups });
+      }
+
       // ─── Zalo account tracking (server-side limit enforcement) ───
 
       // GET /api/accounts?userId=xxx — list registered Zalo accounts
@@ -1227,6 +1301,9 @@ server.listen(PORT, () => {
     checkExpiringSubscriptions().catch(() => {});
     setInterval(() => checkExpiringSubscriptions().catch(() => {}), 6 * 60 * 60 * 1000);
   }).catch(() => {});
+
+  // Ensure group library tables exist
+  ensureGroupLibrarySchema().catch(() => {});
 });
 
 server.on('error', (error) => {

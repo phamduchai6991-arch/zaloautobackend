@@ -1,6 +1,19 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { getAllSubscriptions, getAllOrders, grantAdminSubscription } from './paymentStore.js';
 import { getAllUsers } from './userStore.js';
+import {
+  listCategories,
+  createCategory,
+  updateCategory,
+  deleteCategory,
+  listGroups,
+  bulkAddGroups,
+  updateGroup,
+  deleteGroup,
+  deleteGroupsByCategory,
+  getGroupCount,
+  getCategoryCount,
+} from './groupLibraryStore.js';
 
 const PLAN_LIMITS = { basic: 1, plus: 3, pro: 10 };
 const ACTIVE_WINDOW_MS = 10 * 60 * 1000;
@@ -281,4 +294,107 @@ export async function handleAdminGrantSubscription(req, res, body) {
     subscription: result.subscription,
     message: 'Đã cấp gói thành công.',
   }));
+}
+
+// ─── Group Library Admin Handlers ───
+
+export async function handleAdminListCategories(req, res) {
+  if (!requireAdmin(req, res)) return;
+  const categories = await listCategories();
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, categories }));
+}
+
+export async function handleAdminCreateCategory(req, res, body) {
+  if (!requireAdmin(req, res)) return;
+  const { name, color, sortOrder } = body || {};
+  if (!name?.trim()) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Thiếu tên danh mục.' }));
+    return;
+  }
+  const category = await createCategory(name, color, sortOrder);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, category }));
+}
+
+export async function handleAdminUpdateCategory(req, res, body) {
+  if (!requireAdmin(req, res)) return;
+  const { id, name, color, sortOrder } = body || {};
+  if (!id) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Thiếu id danh mục.' }));
+    return;
+  }
+  const category = await updateCategory(id, { name, color, sortOrder });
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, category }));
+}
+
+export async function handleAdminDeleteCategory(req, res, body) {
+  if (!requireAdmin(req, res)) return;
+  const { id, deleteGroups } = body || {};
+  if (!id) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Thiếu id danh mục.' }));
+    return;
+  }
+  if (deleteGroups) await deleteGroupsByCategory(id);
+  await deleteCategory(id);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true }));
+}
+
+export async function handleAdminListGroups(req, res, params) {
+  if (!requireAdmin(req, res)) return;
+  const groups = await listGroups(params);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, groups }));
+}
+
+export async function handleAdminBulkAddGroups(req, res, body) {
+  if (!requireAdmin(req, res)) return;
+  const { lines, categoryId } = body || {};
+  if (!lines?.trim()) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Thiếu dữ liệu nhóm.' }));
+    return;
+  }
+  const adminUsername = getAdminUsername(req);
+  const inserted = await bulkAddGroups(lines, categoryId, adminUsername);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, count: inserted.length, groups: inserted }));
+}
+
+export async function handleAdminUpdateGroup(req, res, body) {
+  if (!requireAdmin(req, res)) return;
+  const { id, name, inviteLink, description, categoryId, memberCount } = body || {};
+  if (!id) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Thiếu id nhóm.' }));
+    return;
+  }
+  const group = await updateGroup(id, { name, inviteLink, description, categoryId, memberCount });
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, group }));
+}
+
+export async function handleAdminDeleteGroup(req, res, body) {
+  if (!requireAdmin(req, res)) return;
+  const { id } = body || {};
+  if (!id) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Thiếu id nhóm.' }));
+    return;
+  }
+  await deleteGroup(id);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true }));
+}
+
+export async function handleAdminGroupLibraryStats(req, res) {
+  if (!requireAdmin(req, res)) return;
+  const [groupCount, categoryCount] = await Promise.all([getGroupCount(), getCategoryCount()]);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, groupCount, categoryCount }));
 }
