@@ -783,7 +783,7 @@ function setCors(req, res) {
   } else if (ALLOWED_ORIGINS.has(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-AutoZalo-Auth-Type, X-User-Agent');
   res.setHeader('Vary', 'Origin');
 }
@@ -1232,7 +1232,8 @@ const server = createServer(async (req, res) => {
         const text = String(body?.text || '').trim();
         const target = body?.target || 'message'; // 'message' or 'friend'
         if (!text) return writeJson(res, 400, { ok: false, error: 'Thiếu nội dung để viết lại.' });
-        const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || 'sk-6b3964ea846f4e1daabcf8f0c4000986';
+        const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+        if (!DEEPSEEK_API_KEY) return writeJson(res, 503, { ok: false, error: 'AI rewrite chưa được cấu hình (thiếu DEEPSEEK_API_KEY).' });
         const systemPrompt = target === 'friend'
           ? 'Bạn là trợ lý viết lại tin nhắn kết bạn Zalo. Hãy viết lại nội dung sau thành 3 phiên bản khác nhau: 1 bản lịch sự chuyên nghiệp, 1 bản thân thiện gần gũi, 1 bản ngắn gọn súc tích. Mỗi bản tối đa 150 ký tự. Trả về JSON array gồm 3 string, không giải thích thêm.'
           : target === 'rotation'

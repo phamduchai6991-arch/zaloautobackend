@@ -22,7 +22,7 @@ const VALID_PERIODS = new Set(['monthly', 'yearly']);
 
 // Default credentials — override via env vars
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_SECRET   = process.env.ADMIN_SECRET   || 'Duchai0426';
+const ADMIN_SECRET   = process.env.ADMIN_SECRET   || '';
 
 function toBase64Url(value) {
   return Buffer.from(value).toString('base64url');
@@ -98,6 +98,11 @@ function getAdminUsername(req) {
 
 export function handleAdminLogin(req, res, body) {
   const { username, password } = body || {};
+  if (!ADMIN_SECRET) {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'ADMIN_SECRET chưa được cấu hình trên server.' }));
+    return;
+  }
   if (username === ADMIN_USERNAME && password === ADMIN_SECRET) {
     const session = issueAdminToken(username);
     res.writeHead(200, { 'Content-Type': 'application/json' });
