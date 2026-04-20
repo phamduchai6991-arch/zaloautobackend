@@ -1084,6 +1084,28 @@
   function extractMessageContent(message) {
     if (!message || typeof message !== 'object') return '';
 
+    // Try per-message AES decryption if content looks encrypted
+    var contentVal = message.content;
+    if (typeof contentVal === 'string' && contentVal.length > 20 && _encoderModule && typeof _encoderModule.decodeAES === 'function') {
+      // Heuristic: encrypted strings are long base64-like strings without spaces
+      if (!/\s/.test(contentVal) && !/^https?:\/\//.test(contentVal) && !/^\[/.test(contentVal)) {
+        try {
+          var decrypted = _encoderModule.decodeAES(contentVal);
+          if (decrypted && typeof decrypted === 'string') {
+            var parsed = null;
+            try { parsed = JSON.parse(decrypted); } catch (_) {}
+            if (parsed && typeof parsed === 'object') {
+              var decNode = extractContentFromNode(parsed, 0);
+              if (decNode) return decNode;
+            } else if (decrypted.trim()) {
+              var readableDecrypted = toReadableText(decrypted);
+              if (readableDecrypted) return readableDecrypted;
+            }
+          }
+        } catch (_) { /* not encrypted, ignore */ }
+      }
+    }
+
     var fields = [
       message.content,
       message.msg,
@@ -1364,6 +1386,16 @@
               console.warn('[ZaloMain]', zStrategy.name, 'threw:', zErr.message);
             }
           }
+        }
+      }
+
+      // Quality gate: if zStorage returned data but all content is placeholder, discard and try API strategies
+      if (result) {
+        var zStorageMsgs = Array.isArray(result) ? result : extractMessages(result);
+        if (zStorageMsgs.length > 0 && !hasUsableRawMessageContent(zStorageMsgs)) {
+          console.warn('[ZaloMain] getMessageHistory: zStorage returned', zStorageMsgs.length, 'messages but ALL have placeholder content — falling through to API strategies');
+          result = null;
+          source = '';
         }
       }
 
