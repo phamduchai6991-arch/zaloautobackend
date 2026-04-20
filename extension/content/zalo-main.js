@@ -1155,75 +1155,111 @@
     }
 
     count = Number(count) || 20;
+    var httpMod = _httpModule || _businessModule;
+
+    if (!httpMod) {
+      console.warn('[ZaloMain] getMessageHistory: no httpModule or businessModule available');
+      return [];
+    }
+
+    // Log all available message-related methods (first time only)
+    if (!getMessageHistory._loggedMethods) {
+      getMessageHistory._loggedMethods = true;
+      var allMethods = Object.keys(httpMod).filter(function (k) {
+        return typeof httpMod[k] === 'function';
+      }).sort();
+      console.log('[ZaloMain] httpModule methods:', allMethods.join(', '));
+      var msgMethods = allMethods.filter(function (m) {
+        return /msg|message|cm|history|chat|conv/i.test(m);
+      });
+      console.log('[ZaloMain] message-related methods:', msgMethods.join(', '));
+    }
 
     try {
-      // For group chats: fBUP.getHistoryMessage(groupId, count) → GET /api/group/history
-      if (isGroup) {
-        var groupModule = _httpModule || _businessModule;
-        if (groupModule && typeof groupModule.getHistoryMessage === 'function') {
-          console.log('[ZaloMain] getMessageHistory: calling getHistoryMessage for group', threadId);
-          var result = await withTimeout(groupModule.getHistoryMessage(threadId, count), 10000, null);
-          if (result) {
-            console.log('[ZaloMain] group history raw keys:', Object.keys(result));
-            var msgs = extractMessages(result);
-            var arr = msgs.map(normalizeMessage).filter(Boolean);
-            console.log('[ZaloMain] getMessageHistory: group result =', arr.length, 'messages');
-            return arr;
+      var result = null;
+      var source = '';
+
+      // Strategy 1: getCM — works for both 1:1 and groups (cloud messages)
+      if (typeof httpMod.getCM === 'function') {
+        console.log('[ZaloMain] getMessageHistory: trying getCM for', isGroup ? 'group' : '1:1', threadId);
+        try {
+          result = await withTimeout(httpMod.getCM(threadId, 0, 0, count), 12000, null);
+          source = 'getCM';
+        } catch (e) {
+          console.warn('[ZaloMain] getCM threw:', e.message);
+        }
+      }
+
+      // Strategy 2: getHistoryMessage — alternate method
+      if (!result && typeof httpMod.getHistoryMessage === 'function') {
+        console.log('[ZaloMain] getMessageHistory: trying getHistoryMessage for', threadId);
+        try {
+          result = await withTimeout(httpMod.getHistoryMessage(threadId, count), 12000, null);
+          source = 'getHistoryMessage';
+        } catch (e) {
+          console.warn('[ZaloMain] getHistoryMessage threw:', e.message);
+        }
+      }
+
+      // Strategy 3: Try businessModule if httpModule didn't work
+      if (!result && _businessModule && _businessModule !== httpMod) {
+        if (typeof _businessModule.getCM === 'function') {
+          console.log('[ZaloMain] getMessageHistory: trying businessModule.getCM');
+          try {
+            result = await withTimeout(_businessModule.getCM(threadId, 0, 0, count), 12000, null);
+            source = 'businessModule.getCM';
+          } catch (e) {
+            console.warn('[ZaloMain] businessModule.getCM threw:', e.message);
           }
         }
-        console.warn('[ZaloMain] getMessageHistory: getHistoryMessage not available for groups');
+        if (!result && typeof _businessModule.getHistoryMessage === 'function') {
+          console.log('[ZaloMain] getMessageHistory: trying businessModule.getHistoryMessage');
+          try {
+            result = await withTimeout(_businessModule.getHistoryMessage(threadId, count), 12000, null);
+            source = 'businessModule.getHistoryMessage';
+          } catch (e) {
+            console.warn('[ZaloMain] businessModule.getHistoryMessage threw:', e.message);
+          }
+        }
+      }
+
+      if (!result) {
+        console.warn('[ZaloMain] getMessageHistory: all strategies returned null for', threadId);
         return [];
       }
 
-      // For 1:1 chats: fBUP.getCM(threadId, globalMsgId, ?, count) → GET /api/cm/getrecentv2
-      var httpMod = _httpModule;
-      if (!httpMod) httpMod = _businessModule;
+      // Deep logging of the raw result
+      console.log('[ZaloMain] getMessageHistory via', source, 'raw type:', typeof result);
+      if (typeof result === 'object' && result !== null) {
+        var topKeys = Object.keys(result);
+        console.log('[ZaloMain] result keys:', topKeys.join(', '));
+        // Log first 500 chars of stringified result for debugging
+        try {
+          var preview = JSON.stringify(result).slice(0, 500);
+          console.log('[ZaloMain] result preview:', preview);
+        } catch (_) {}
 
-      // Primary: getCM (Cloud Messages) - the correct API for 1:1 message history
-      // getCM(conversationId, globalMsgId=0, unknownParam=0, count, reqId?, timeout?, opts?)
-      if (httpMod && typeof httpMod.getCM === 'function') {
-        console.log('[ZaloMain] getMessageHistory: calling getCM for 1:1 chat', threadId);
-        var cmResult = await withTimeout(httpMod.getCM(threadId, 0, 0, count), 10000, null);
-        if (cmResult) {
-          // Log raw structure to understand response format
-          console.log('[ZaloMain] getCM raw keys:', Object.keys(cmResult));
-          if (cmResult.msgs) console.log('[ZaloMain] getCM msgs count:', cmResult.msgs.length, 'sample:', cmResult.msgs[0] ? Object.keys(cmResult.msgs[0]) : 'empty');
-          if (cmResult.data && typeof cmResult.data === 'object') {
-            console.log('[ZaloMain] getCM data type:', typeof cmResult.data, Array.isArray(cmResult.data) ? 'array(' + cmResult.data.length + ')' : 'keys:' + Object.keys(cmResult.data).join(','));
-            if (cmResult.data.msgs) console.log('[ZaloMain] getCM data.msgs count:', cmResult.data.msgs.length, 'sample:', cmResult.data.msgs[0] ? Object.keys(cmResult.data.msgs[0]) : 'empty');
-          }
-          
-          var cmMsgs = extractMessages(cmResult);
-          var cmArr = cmMsgs.map(normalizeMessage).filter(Boolean);
-          console.log('[ZaloMain] getMessageHistory: getCM result =', cmArr.length, 'messages');
-          if (cmArr.length > 0) return cmArr;
-        }
-      }
-
-      // Fallback: try getHistoryMessage for 1:1 as well (some Zalo versions)
-      if (httpMod && typeof httpMod.getHistoryMessage === 'function') {
-        console.log('[ZaloMain] getMessageHistory: trying getHistoryMessage fallback for 1:1', threadId);
-        var histResult = await withTimeout(httpMod.getHistoryMessage(threadId, count), 10000, null);
-        if (histResult) {
-          var histMsgs = extractMessages(histResult);
-          var histArr = histMsgs.map(normalizeMessage).filter(Boolean);
-          if (histArr.length > 0) {
-            console.log('[ZaloMain] getMessageHistory: getHistoryMessage fallback =', histArr.length, 'messages');
-            return histArr;
+        // Check nested data
+        if (result.data && typeof result.data === 'object') {
+          console.log('[ZaloMain] result.data keys:', Object.keys(result.data).join(', '));
+          if (result.data.data && typeof result.data.data === 'object') {
+            console.log('[ZaloMain] result.data.data keys:', Object.keys(result.data.data).join(', '));
           }
         }
       }
 
-      // Log available methods for debugging (only first time)
-      if (httpMod && !getMessageHistory._loggedMethods) {
-        getMessageHistory._loggedMethods = true;
-        var allMethods = Object.keys(httpMod).filter(function (k) {
-          return typeof httpMod[k] === 'function';
-        }).sort();
-        console.log('[ZaloMain] All httpModule methods:', allMethods.join(', '));
+      var msgs = extractMessages(result);
+      console.log('[ZaloMain] extractMessages returned', msgs.length, 'raw items');
+      if (msgs.length > 0 && msgs[0]) {
+        console.log('[ZaloMain] first raw message keys:', Object.keys(msgs[0]).join(', '));
+        try {
+          console.log('[ZaloMain] first raw message preview:', JSON.stringify(msgs[0]).slice(0, 300));
+        } catch (_) {}
       }
 
-      return [];
+      var arr = msgs.map(normalizeMessage).filter(Boolean);
+      console.log('[ZaloMain] getMessageHistory final:', arr.length, 'messages from', source);
+      return arr;
     } catch (err) {
       console.error('[ZaloMain] getMessageHistory error:', err.message || err);
       return [];
@@ -1241,6 +1277,29 @@
       if (Array.isArray(result.data.msgs)) return result.data.msgs;
       if (Array.isArray(result.data.groupMsgs)) return result.data.groupMsgs;
       if (Array.isArray(result.data.messages)) return result.data.messages;
+      // Triple-nested: result.data.data.msgs
+      if (result.data.data && typeof result.data.data === 'object') {
+        if (Array.isArray(result.data.data.msgs)) return result.data.data.msgs;
+        if (Array.isArray(result.data.data.groupMsgs)) return result.data.data.groupMsgs;
+      }
+    }
+    // Handle AES-encrypted data string: { error_code, data: "<encrypted>" }
+    if (typeof result.data === 'string' && result.data.length > 10 && _encoderModule && typeof _encoderModule.decodeAES === 'function') {
+      try {
+        var decrypted = _encoderModule.decodeAES(result.data);
+        if (decrypted) {
+          var parsed = JSON.parse(decrypted);
+          console.log('[ZaloMain] extractMessages: decrypted AES data, keys:', Object.keys(parsed));
+          if (parsed.data && typeof parsed.data === 'object') {
+            if (Array.isArray(parsed.data.msgs)) return parsed.data.msgs;
+            if (Array.isArray(parsed.data.groupMsgs)) return parsed.data.groupMsgs;
+          }
+          if (Array.isArray(parsed.msgs)) return parsed.msgs;
+          if (Array.isArray(parsed.groupMsgs)) return parsed.groupMsgs;
+        }
+      } catch (e) {
+        console.warn('[ZaloMain] extractMessages: AES decrypt failed:', e.message);
+      }
     }
     if (Array.isArray(result.data)) return result.data;
     if (Array.isArray(result.messages)) return result.messages;
@@ -2390,6 +2449,67 @@
 
       case 'getMessageHistory': {
         return getMessageHistory(args.threadId, !!args.isGroup, args.count || 20);
+      }
+
+      case 'debugGetMessageHistory': {
+        // Full diagnostic for message history — returns detailed info about what's happening
+        var diagThreadId = args.threadId || '';
+        var diagIsGroup = !!args.isGroup;
+        var diagCount = args.count || 5;
+        var diag = {
+          threadId: diagThreadId,
+          isGroup: diagIsGroup,
+          apiReady: _apiReady,
+          hasHttpModule: !!_httpModule,
+          hasBusinessModule: !!_businessModule,
+          hasEncoderModule: !!_encoderModule,
+          httpModuleMethods: [],
+          getCMAvailable: false,
+          getHistoryMessageAvailable: false,
+          getCMResult: null,
+          getCMError: null,
+          getHistoryMessageResult: null,
+          getHistoryMessageError: null,
+          extractedCount: 0,
+        };
+        
+        var httpMod = _httpModule || _businessModule;
+        if (httpMod) {
+          diag.httpModuleMethods = Object.keys(httpMod).filter(function (k) {
+            return typeof httpMod[k] === 'function' && /msg|message|cm|history|chat|conv|cloud|sync/i.test(k);
+          }).sort();
+          diag.getCMAvailable = typeof httpMod.getCM === 'function';
+          diag.getHistoryMessageAvailable = typeof httpMod.getHistoryMessage === 'function';
+          
+          if (diagThreadId && diag.getCMAvailable) {
+            try {
+              var diagCM = await withTimeout(httpMod.getCM(diagThreadId, 0, 0, diagCount), 12000, null);
+              if (diagCM) {
+                diag.getCMResult = {
+                  type: typeof diagCM,
+                  keys: Object.keys(diagCM),
+                  preview: JSON.stringify(diagCM).slice(0, 1000),
+                  dataType: diagCM.data ? typeof diagCM.data : 'none',
+                  dataKeys: diagCM.data && typeof diagCM.data === 'object' ? Object.keys(diagCM.data) : [],
+                  errorCode: diagCM.error_code,
+                };
+                var diagMsgs = extractMessages(diagCM);
+                diag.extractedCount = diagMsgs.length;
+                if (diagMsgs.length > 0) {
+                  diag.firstMessageKeys = Object.keys(diagMsgs[0]);
+                  diag.firstMessagePreview = JSON.stringify(diagMsgs[0]).slice(0, 300);
+                }
+              } else {
+                diag.getCMResult = 'null (timeout or empty)';
+              }
+            } catch (e) {
+              diag.getCMError = e.message;
+            }
+          }
+        }
+        
+        console.log('[ZaloMain] debugGetMessageHistory:', JSON.stringify(diag, null, 2));
+        return Promise.resolve(diag);
       }
 
       case 'debugModuleMethods': {
