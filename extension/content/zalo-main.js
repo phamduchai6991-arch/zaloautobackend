@@ -1242,6 +1242,52 @@
       var result = null;
       var source = '';
       var allModules = [httpMod, bizMod].filter(function (m, i, arr) { return m && arr.indexOf(m) === i; });
+      var zsHistory = window.$$afmc && window.$$afmc.zStorage;
+
+      // Strategy 0: direct local message store via zStorage.
+      // This is the most stable path because it returns already-normalized runtime message objects.
+      if (zsHistory) {
+        var zStorageStrategies = [
+          {
+            name: 'zStorage.getMessageFromConversationByLimit',
+            fn: function () {
+              return typeof zsHistory.getMessageFromConversationByLimit === 'function'
+                ? zsHistory.getMessageFromConversationByLimit(threadId, count)
+                : null;
+            },
+          },
+          {
+            name: 'zStorage.getAllMessagesFromConversationSingle',
+            fn: function () {
+              return typeof zsHistory.getAllMessagesFromConversationSingle === 'function'
+                ? zsHistory.getAllMessagesFromConversationSingle(threadId, undefined, undefined, count)
+                : null;
+            },
+          },
+          {
+            name: 'zStorage.getAllMessagesFromConversation',
+            fn: function () {
+              return typeof zsHistory.getAllMessagesFromConversation === 'function'
+                ? zsHistory.getAllMessagesFromConversation(threadId)
+                : null;
+            },
+          },
+        ];
+
+        for (var zsi = 0; zsi < zStorageStrategies.length && !result; zsi += 1) {
+          var zStrategy = zStorageStrategies[zsi];
+          try {
+            console.log('[ZaloMain] getMessageHistory: trying', zStrategy.name, 'for', threadId);
+            var zStorageResult = await withTimeout(zStrategy.fn(), 8000, null);
+            if (Array.isArray(zStorageResult) && zStorageResult.length > 0) {
+              result = zStorageResult;
+              source = zStrategy.name;
+            }
+          } catch (zErr) {
+            console.warn('[ZaloMain]', zStrategy.name, 'threw:', zErr.message);
+          }
+        }
+      }
 
       // Strategy 1: getCM with FULL 7 parameters
       for (var si = 0; si < allModules.length && !result; si++) {
