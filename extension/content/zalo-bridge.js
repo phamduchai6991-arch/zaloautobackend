@@ -703,6 +703,27 @@
     return finalizeDomMessages(messages, count);
   }
 
+  async function hydrateConversationForHistory(request) {
+    var args = request && request.args ? request.args : {};
+    var metaConversation = request && request.meta && request.meta.conversation ? request.meta.conversation : {};
+    var threadId = args.threadId || metaConversation.id || metaConversation.rawId || '';
+
+    if (!threadId) return;
+
+    try {
+      await openConversation({
+        zid: threadId,
+        name: metaConversation.displayName || metaConversation.name || '',
+        phone: metaConversation.phone || '',
+        isGroup: !!args.isGroup,
+        sourceTab: args.isGroup ? 'group' : 'friend',
+      });
+      await sleep(900);
+    } catch (error) {
+      console.log('[ZaloBridge] hydrateConversationForHistory skipped:', error.message);
+    }
+  }
+
   async function sendThroughComposer(composer, content) {
     if (!composer) {
       throw new Error('Không tìm thấy ô soạn tin nhắn.');
@@ -906,6 +927,8 @@
             var apiHistory = [];
             var apiHistoryError = null;
 
+            await hydrateConversationForHistory(request);
+
             try {
               apiHistory = await callZaloApi(request.method, request.args || {});
             } catch (error) {
@@ -936,6 +959,10 @@
 
               throw (apiHistoryError || domError);
             }
+          }
+
+          if (request.method === 'debugGetMessageHistory') {
+            await hydrateConversationForHistory(request);
           }
 
           if (request.method === 'sendZText' && request.meta && request.meta.job) {

@@ -1404,6 +1404,13 @@
         } catch (_) {}
       }
 
+      var paginationResult = await enrichMessageHistoryWithGetCM(allModules, threadId, count, msgs);
+      if (paginationResult.pages > 0) {
+        msgs = paginationResult.messages;
+        source += ' + getCM.pagination';
+        console.log('[ZaloMain] getMessageHistory pagination added', paginationResult.pages, 'page(s), total raw items:', msgs.length);
+      }
+
       var arr = msgs.map(normalizeMessage).filter(Boolean);
       console.log('[ZaloMain] getMessageHistory final:', arr.length, 'messages from', source);
       return arr;
@@ -1477,6 +1484,126 @@
     // Don't use toArray — it converts metadata fields into fake messages
     return [];
   }
+
+    function isPlaceholderMessageContent(value) {
+      var normalized = String(value || '').trim();
+      return !normalized || normalized === '[Tin nhắn không có nội dung]';
+    }
+
+    function getMessageHistoryKey(msg) {
+      if (!msg || typeof msg !== 'object') return '';
+      return [
+        String(msg.msgId || msg.globalMsgId || msg.actionId || msg.realMsgId || msg.id || ''),
+        String(msg.cliMsgId || ''),
+        String(msg.ts || msg.sendDttm || msg.createTime || msg.time || ''),
+        String(msg.uidFrom || msg.fromUid || msg.fromId || msg.senderId || msg.uid || ''),
+        String(msg.idTo || msg.toId || msg.toUid || ''),
+      ].join('|');
+    }
+
+    function getMessageHistoryAnchor(msg) {
+      if (!msg || typeof msg !== 'object') return '';
+      return String(msg.globalMsgId || msg.msgId || msg.actionId || msg.realMsgId || msg.id || '');
+    }
+
+    function hasUsableRawMessageContent(messages) {
+      return Array.isArray(messages) && messages.some(function (message) {
+        return !isPlaceholderMessageContent(extractMessageContent(message));
+      });
+    }
+
+    function mergeRawHistoryMessages(existingMessages, incomingMessages) {
+      var merged = [];
+      var seen = new Set();
+      var candidates = [].concat(incomingMessages || [], existingMessages || []);
+
+      for (var index = 0; index < candidates.length; index += 1) {
+        var item = candidates[index];
+        if (!item || typeof item !== 'object') continue;
+        var key = getMessageHistoryKey(item);
+        if (key && seen.has(key)) continue;
+        if (key) seen.add(key);
+        merged.push(item);
+      }
+
+      return merged;
+    }
+
+    function findOldestHistoryAnchor(messages) {
+      if (!Array.isArray(messages) || messages.length === 0) return '';
+
+      var oldest = null;
+      var oldestTs = Infinity;
+      for (var index = 0; index < messages.length; index += 1) {
+        var message = messages[index];
+        var anchor = getMessageHistoryAnchor(message);
+        if (!anchor) continue;
+
+        var ts = normalizeTimestamp(
+          message.ts ||
+          message.sendDttm ||
+          message.createTime ||
+          message.time ||
+          0
+        );
+
+        if (ts > 0 && ts < oldestTs) {
+          oldest = message;
+          oldestTs = ts;
+        } else if (!oldest) {
+          oldest = message;
+        }
+      }
+
+      return getMessageHistoryAnchor(oldest);
+    }
+
+    async function enrichMessageHistoryWithGetCM(allModules, threadId, count, seedMessages) {
+      var merged = Array.isArray(seedMessages) ? seedMessages.slice() : [];
+      var pages = 0;
+      var previousAnchor = '';
+      var maxPages = 2;
+
+      if (!merged.length) {
+        return { messages: merged, pages: pages };
+      }
+
+      while (pages < maxPages && (merged.length < count || !hasUsableRawMessageContent(merged))) {
+        var anchor = findOldestHistoryAnchor(merged);
+        if (!anchor || anchor === previousAnchor) break;
+        previousAnchor = anchor;
+
+        var pageLoaded = false;
+        for (var index = 0; index < allModules.length; index += 1) {
+          var mod = allModules[index];
+          if (!mod || typeof mod.getCM !== 'function') continue;
+          var modName = mod === _httpModule ? 'httpModule' : 'businessModule';
+
+          try {
+            var reqId = Date.now() + pages + index;
+            var pageSize = Math.min(Math.max(count - merged.length, 10), 50);
+            console.log('[ZaloMain] getMessageHistory: paging older history via', modName + '.getCM', 'anchor', anchor, 'pageSize', pageSize);
+            var pageResult = await withTimeout(mod.getCM(threadId, anchor, 0, pageSize, reqId, 10000, {}), 12000, null);
+            var pageMessages = extractMessages(pageResult);
+            if (!pageMessages.length) continue;
+
+            var nextMerged = mergeRawHistoryMessages(merged, pageMessages);
+            if (nextMerged.length === merged.length) continue;
+
+            merged = nextMerged;
+            pages += 1;
+            pageLoaded = true;
+            break;
+          } catch (error) {
+            console.warn('[ZaloMain]', modName + '.getCM pagination threw:', error.message);
+          }
+        }
+
+        if (!pageLoaded) break;
+      }
+
+      return { messages: merged, pages: pages };
+    }
 
   function normalizeMessage(msg) {
     if (!msg || typeof msg !== 'object') return null;
