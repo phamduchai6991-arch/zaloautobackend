@@ -2557,32 +2557,37 @@
           diag.getCloudMessageJumpAvailable = typeof diagHttpMod.getCloudMessageJump === 'function';
           
           if (diagThreadId && diag.getCMAvailable) {
-            try {
-              var diagReqId = Date.now();
-              var diagCM = await withTimeout(diagHttpMod.getCM(diagThreadId, 0, 0, diagCount, diagReqId, 10000, {}), 15000, null);
-              if (diagCM) {
-                diag.getCMResult = {
-                  type: typeof diagCM,
-                  keys: Object.keys(diagCM),
-                  preview: JSON.stringify(diagCM).slice(0, 1500),
-                  dataType: diagCM.data ? typeof diagCM.data : 'none',
-                  dataKeys: diagCM.data && typeof diagCM.data === 'object' ? Object.keys(diagCM.data) : [],
-                  dataStringLength: typeof diagCM.data === 'string' ? diagCM.data.length : 0,
-                  errorCode: diagCM.error_code,
-                  errorMessage: diagCM.error_message,
-                };
-                var diagMsgs = extractMessages(diagCM);
-                diag.extractedCount = diagMsgs.length;
-                if (diagMsgs.length > 0) {
-                  diag.firstMessageKeys = Object.keys(diagMsgs[0]);
-                  diag.firstMessagePreview = JSON.stringify(diagMsgs[0]).slice(0, 500);
+            // Wrap in async IIFE since executeApiCall is not async
+            return (async function () {
+              try {
+                var diagReqId = Date.now();
+                var diagCM = await withTimeout(diagHttpMod.getCM(diagThreadId, 0, 0, diagCount, diagReqId, 10000, {}), 15000, null);
+                if (diagCM) {
+                  diag.getCMResult = {
+                    type: typeof diagCM,
+                    keys: Object.keys(diagCM),
+                    preview: JSON.stringify(diagCM).slice(0, 1500),
+                    dataType: diagCM.data ? typeof diagCM.data : 'none',
+                    dataKeys: diagCM.data && typeof diagCM.data === 'object' ? Object.keys(diagCM.data) : [],
+                    dataStringLength: typeof diagCM.data === 'string' ? diagCM.data.length : 0,
+                    errorCode: diagCM.error_code,
+                    errorMessage: diagCM.error_message,
+                  };
+                  var diagMsgs = extractMessages(diagCM);
+                  diag.extractedCount = diagMsgs.length;
+                  if (diagMsgs.length > 0) {
+                    diag.firstMessageKeys = Object.keys(diagMsgs[0]);
+                    diag.firstMessagePreview = JSON.stringify(diagMsgs[0]).slice(0, 500);
+                  }
+                } else {
+                  diag.getCMResult = 'null (timeout or empty)';
                 }
-              } else {
-                diag.getCMResult = 'null (timeout or empty)';
+              } catch (e) {
+                diag.getCMError = e.message;
               }
-            } catch (e) {
-              diag.getCMError = e.message;
-            }
+              console.log('[ZaloMain] debugGetMessageHistory:', JSON.stringify(diag, null, 2));
+              return diag;
+            })();
           }
         }
         
