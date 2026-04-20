@@ -924,10 +924,14 @@
               sendResponse({ ok: true, data: mergedHistory });
               return;
             } catch (domError) {
-              if (Array.isArray(apiHistory) && apiHistory.length > 0) {
+              if (Array.isArray(apiHistory) && apiHistory.length > 0 && !shouldFallbackMessageHistory(apiHistory)) {
                 console.log('[ZaloBridge] DOM history fallback skipped:', domError.message);
                 sendResponse({ ok: true, data: apiHistory });
                 return;
+              }
+
+              if (Array.isArray(apiHistory) && apiHistory.length > 0) {
+                throw new Error('Zalo API chỉ trả placeholder và DOM fallback thất bại: ' + domError.message);
               }
 
               throw (apiHistoryError || domError);

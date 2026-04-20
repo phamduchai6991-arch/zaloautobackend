@@ -100,6 +100,7 @@
           fromId: String(msg.uidFrom || msg.fromUid || msg.fromId || msg.senderId || msg.uid || ''),
           toId: String(msg.idTo || msg.toId || msg.toUid || ''),
           content: extractMessageContent(msg) || '[Tin nhắn không có nội dung]',
+          rawContent: msg.content || null,
           ts: Number(msg.ts || 0),
           msgType: msg.msgType || msg.type || 'text',
           dName: msg.dName || '',
@@ -904,10 +905,48 @@
     return '';
   }
 
+  function tryParseJsonString(value) {
+    var text = String(value || '').trim();
+    if (!text) return null;
+    if (text.charAt(0) !== '{' && text.charAt(0) !== '[') return null;
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function inferMessageLabel(node) {
+    if (!node || typeof node !== 'object') return '';
+
+    var type = String(node.msgType || node.type || node.mediaType || node.attachmentType || '').toLowerCase();
+    var containType = Number((node.paramsExt && node.paramsExt.containType) || node.containType || 0);
+
+    if (node.fileName || node.file_name) return '[File] ' + (node.fileName || node.file_name);
+    if (node.thumb || node.thumbSrc || node.hdUrl || node.normalUrl || node.imageUrl || node.photoUrl || node.thumbnail || node.image) return '[Hình ảnh]';
+    if (node.videoUrl || node.video || type.indexOf('video') !== -1) return '[Video]';
+    if (node.audioUrl || node.voiceUrl || node.audio || type.indexOf('audio') !== -1 || type.indexOf('voice') !== -1) return '[Âm thanh]';
+    if (node.stickerId || type.indexOf('sticker') !== -1) return '[Sticker]';
+    if (type.indexOf('location') !== -1) return '[Vị trí]';
+    if (type.indexOf('file') !== -1) return '[Tệp đính kèm]';
+    if (type.indexOf('gif') !== -1) return '[GIF]';
+    if (type.indexOf('link') !== -1) return '[Liên kết]';
+    if (type.indexOf('photo') !== -1 || containType === 2) return '[Hình ảnh]';
+    if (type.indexOf('poll') !== -1) return '[Bình chọn]';
+    if (type.indexOf('todo') !== -1) return '[Công việc]';
+
+    return '';
+  }
+
   function extractContentFromNode(node, depth) {
     if (depth > 4 || node == null) return '';
 
     if (typeof node === 'string' || typeof node === 'number') {
+      var parsedNode = typeof node === 'string' ? tryParseJsonString(node) : null;
+      if (parsedNode) {
+        var parsedText = extractContentFromNode(parsedNode, depth + 1);
+        if (parsedText) return parsedText;
+      }
       return toReadableText(node);
     }
 
@@ -926,10 +965,15 @@
       node.content,
       node.description,
       node.title,
+      node.name,
+      node.subTitle,
+      node.subtitle,
       node.caption,
       node.body,
       node.msg,
       node.message,
+      node.summary,
+      node.snippet,
       node.href,
       node.url,
       node.link,
@@ -945,23 +989,8 @@
       }
     }
 
-    if (node.fileName || node.file_name) {
-      return '[File] ' + (node.fileName || node.file_name);
-    }
-
-    var type = String(node.type || node.msgType || node.mediaType || node.attachmentType || '').toLowerCase();
-    if (node.thumb || node.thumbSrc || node.hdUrl || node.normalUrl || node.imageUrl || node.photoUrl || node.thumbnail || node.image) {
-      return '[Hình ảnh]';
-    }
-    if (node.videoUrl || node.video || type.indexOf('video') !== -1) {
-      return '[Video]';
-    }
-    if (node.audioUrl || node.voiceUrl || node.audio || type.indexOf('audio') !== -1 || type.indexOf('voice') !== -1) {
-      return '[Âm thanh]';
-    }
-    if (node.stickerId || type.indexOf('sticker') !== -1) {
-      return '[Sticker]';
-    }
+    var inferredLabel = inferMessageLabel(node);
+    if (inferredLabel) return inferredLabel;
 
     var nestedCandidates = [
       node.data,
@@ -978,6 +1007,11 @@
     for (var nestedIndex = 0; nestedIndex < nestedCandidates.length; nestedIndex += 1) {
       var nestedText = extractContentFromNode(nestedCandidates[nestedIndex], depth + 1);
       if (nestedText) return nestedText;
+    }
+
+    if (node.quote && typeof node.quote === 'object') {
+      var quoteText = extractContentFromNode(node.quote.msg, depth + 1) || extractContentFromNode(node.quote.attach, depth + 1);
+      if (quoteText) return quoteText;
     }
 
     return '';
@@ -1010,6 +1044,9 @@
       var content = extractContentFromNode(fields[fieldIndex], 0);
       if (content) return content;
     }
+
+    var fallbackLabel = inferMessageLabel(message);
+    if (fallbackLabel) return fallbackLabel;
 
     return '';
   }
@@ -1395,6 +1432,7 @@
       fromId: fromId,
       toId: toId,
       content: content,
+      rawContent: msg.content || null,
       ts: ts,
       msgType: msg.msgType || msg.type || 'text',
       status: msg.status || 0,
