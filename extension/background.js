@@ -299,6 +299,8 @@ async function confirmAccountSync(requestId) {
 
   const summary = buildAccountSummary(pendingAccountSync.accountData);
   pendingAccountSync = null;
+  pendingLoginTabId = null;
+  clearPendingTimers();
   await broadcastSyncState('ready', {
     requestId: null,
     summary,
@@ -1264,6 +1266,7 @@ async function startMessageBatch(payload) {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (tabId !== pendingLoginTabId) return;
+  if (loginCompleted) return;
   if (changeInfo.status === 'complete' && tab?.url?.includes('chat.zalo.me')) {
     console.log('[ZaloTool BG] Pending login tab completed:', tab.url);
     scheduleReextract(tabId, 'tab-complete');

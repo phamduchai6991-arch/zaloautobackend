@@ -718,7 +718,28 @@
         isGroup: !!args.isGroup,
         sourceTab: args.isGroup ? 'group' : 'friend',
       });
-      await sleep(900);
+      // Wait for Zalo to load messages from cloud into local store.
+      // Poll zStorage readiness for up to 3s instead of fixed sleep.
+      var maxWait = 3000;
+      var interval = 300;
+      var waited = 0;
+      while (waited < maxWait) {
+        await sleep(interval);
+        waited += interval;
+        try {
+          var zs = window.$$afmc && window.$$afmc.zStorage;
+          if (zs && typeof zs.getMessageFromConversationByLimit === 'function') {
+            var probe = zs.getMessageFromConversationByLimit(threadId, 1);
+            if (probe && ((Array.isArray(probe) && probe.length > 0) || (probe.then && (await probe).length > 0))) {
+              console.log('[ZaloBridge] hydrateConversationForHistory: zStorage ready after', waited, 'ms');
+              break;
+            }
+          }
+        } catch (_) {}
+      }
+      if (waited >= maxWait) {
+        console.log('[ZaloBridge] hydrateConversationForHistory: timed out waiting for zStorage, proceeding anyway');
+      }
     } catch (error) {
       console.log('[ZaloBridge] hydrateConversationForHistory skipped:', error.message);
     }

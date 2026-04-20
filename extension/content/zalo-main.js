@@ -501,18 +501,82 @@
     if (!_wr) return false;
 
     // Load transport + business modules from Zalo's webpack runtime.
-    try {
-      var fBUP = _wr('fBUP');
-      _httpModule = fBUP && fBUP.default;
-    } catch (e) {
-      console.warn('[ZaloMain] Failed to load fBUP:', e.message);
+    // Strategy A: Try known hardcoded IDs first (fast path)
+    var knownHttpIds = ['fBUP', 'httpApi', 'http_transport', 'apiTransport'];
+    var knownBizIds = ['dThN', 'bizService', 'business_logic', 'serviceApi'];
+    for (var hi = 0; hi < knownHttpIds.length && !_httpModule; hi++) {
+      try {
+        var hMod = _wr(knownHttpIds[hi]);
+        var hDef = hMod && (hMod.default || hMod);
+        if (hDef && typeof hDef.getCM === 'function') {
+          _httpModule = hDef;
+          console.log('[ZaloMain] Found httpModule via known ID:', knownHttpIds[hi]);
+        }
+      } catch (_) {}
+    }
+    for (var bi = 0; bi < knownBizIds.length && !_businessModule; bi++) {
+      try {
+        var bMod = _wr(knownBizIds[bi]);
+        var bDef = bMod && (bMod.default || bMod);
+        if (bDef && (typeof bDef.getCM === 'function' || typeof bDef.getHistoryMessage === 'function')) {
+          _businessModule = bDef;
+          console.log('[ZaloMain] Found businessModule via known ID:', knownBizIds[bi]);
+        }
+      } catch (_) {}
     }
 
-    try {
-      var dThN = _wr('dThN');
-      _businessModule = dThN && dThN.default;
-    } catch (e) {
-      console.warn('[ZaloMain] Failed to load dThN:', e.message);
+    // Strategy B: Scan loaded webpack module cache for getCM / getHistoryMessage
+    if ((!_httpModule || !_businessModule) && _wr && _wr.c) {
+      var cKeys = Object.keys(_wr.c);
+      console.log('[ZaloMain] Scanning', cKeys.length, 'webpack cached modules for getCM/getHistoryMessage...');
+      for (var sci = 0; sci < cKeys.length; sci++) {
+        try {
+          var scMod = _wr.c[cKeys[sci]];
+          var scExp = scMod && scMod.exports;
+          var scDef = scExp && (scExp.default || scExp);
+          if (!scDef || typeof scDef !== 'object') continue;
+          if (typeof scDef.getCM !== 'function') continue;
+          if (!_httpModule && typeof scDef.sendTextMessage === 'function') {
+            _httpModule = scDef;
+            console.log('[ZaloMain] Found httpModule by cache scan, key:', cKeys[sci]);
+          } else if (!_businessModule) {
+            _businessModule = scDef;
+            console.log('[ZaloMain] Found businessModule by cache scan, key:', cKeys[sci]);
+          }
+          if (_httpModule && _businessModule) break;
+        } catch (_) {}
+      }
+    }
+
+    // Strategy C: Scan unloaded module source for getCM signature, then load matching
+    if ((!_httpModule || !_businessModule) && _wr && _wr.m) {
+      var srcKeys = Object.keys(_wr.m);
+      var httpBizCandidates = [];
+      for (var smi = 0; smi < srcKeys.length; smi++) {
+        try {
+          var srcFn = _wr.m[srcKeys[smi]];
+          var srcText = typeof srcFn === 'function' ? srcFn.toString() : '';
+          if (srcText.indexOf('getCM') !== -1 && srcText.indexOf('getHistoryMessage') !== -1) {
+            httpBizCandidates.push(srcKeys[smi]);
+          }
+        } catch (_) {}
+      }
+      console.log('[ZaloMain] Found', httpBizCandidates.length, 'candidate http/biz modules from source scan');
+      for (var hci = 0; hci < httpBizCandidates.length && (!_httpModule || !_businessModule); hci++) {
+        try {
+          var tryHM = _wr(httpBizCandidates[hci]);
+          var tryHDef = tryHM && (tryHM.default || tryHM);
+          if (tryHDef && typeof tryHDef.getCM === 'function') {
+            if (!_httpModule) {
+              _httpModule = tryHDef;
+              console.log('[ZaloMain] Found httpModule by source scan, ID:', httpBizCandidates[hci]);
+            } else if (!_businessModule && tryHDef !== _httpModule) {
+              _businessModule = tryHDef;
+              console.log('[ZaloMain] Found businessModule by source scan, ID:', httpBizCandidates[hci]);
+            }
+          }
+        } catch (_) {}
+      }
     }
 
     // Load AES encoder module — needed for decodeAES hook
@@ -1244,65 +1308,81 @@
       var allModules = [httpMod, bizMod].filter(function (m, i, arr) { return m && arr.indexOf(m) === i; });
       var zsHistory = window.$$afmc && window.$$afmc.zStorage;
 
+      // Build list of threadId variants to try (some APIs need g-prefix, some don't)
+      var threadIdsToTry = [threadId];
+      if (isGroup) {
+        if (threadId.charAt(0) === 'g' || threadId.charAt(0) === 'G') {
+          threadIdsToTry.push(threadId.slice(1)); // stripped version
+        } else {
+          threadIdsToTry.push('g' + threadId); // g-prefixed version
+        }
+      }
+      console.log('[ZaloMain] getMessageHistory: threadIds to try:', threadIdsToTry.join(', '));
+
       // Strategy 0: direct local message store via zStorage.
       // This is the most stable path because it returns already-normalized runtime message objects.
       if (zsHistory) {
-        var zStorageStrategies = [
-          {
-            name: 'zStorage.getMessageFromConversationByLimit',
-            fn: function () {
-              return typeof zsHistory.getMessageFromConversationByLimit === 'function'
-                ? zsHistory.getMessageFromConversationByLimit(threadId, count)
-                : null;
+        for (var tidx = 0; tidx < threadIdsToTry.length && !result; tidx++) {
+          var tryId = threadIdsToTry[tidx];
+          var zStorageStrategies = [
+            {
+              name: 'zStorage.getMessageFromConversationByLimit',
+              fn: function () {
+                return typeof zsHistory.getMessageFromConversationByLimit === 'function'
+                  ? zsHistory.getMessageFromConversationByLimit(tryId, count)
+                  : null;
+              },
             },
-          },
-          {
-            name: 'zStorage.getAllMessagesFromConversationSingle',
-            fn: function () {
-              return typeof zsHistory.getAllMessagesFromConversationSingle === 'function'
-                ? zsHistory.getAllMessagesFromConversationSingle(threadId, undefined, undefined, count)
-                : null;
+            {
+              name: 'zStorage.getAllMessagesFromConversationSingle',
+              fn: function () {
+                return typeof zsHistory.getAllMessagesFromConversationSingle === 'function'
+                  ? zsHistory.getAllMessagesFromConversationSingle(tryId, undefined, undefined, count)
+                  : null;
+              },
             },
-          },
-          {
-            name: 'zStorage.getAllMessagesFromConversation',
-            fn: function () {
-              return typeof zsHistory.getAllMessagesFromConversation === 'function'
-                ? zsHistory.getAllMessagesFromConversation(threadId)
-                : null;
+            {
+              name: 'zStorage.getAllMessagesFromConversation',
+              fn: function () {
+                return typeof zsHistory.getAllMessagesFromConversation === 'function'
+                  ? zsHistory.getAllMessagesFromConversation(tryId)
+                  : null;
+              },
             },
-          },
-        ];
+          ];
 
-        for (var zsi = 0; zsi < zStorageStrategies.length && !result; zsi += 1) {
-          var zStrategy = zStorageStrategies[zsi];
-          try {
-            console.log('[ZaloMain] getMessageHistory: trying', zStrategy.name, 'for', threadId);
-            var zStorageResult = await withTimeout(zStrategy.fn(), 8000, null);
-            if (Array.isArray(zStorageResult) && zStorageResult.length > 0) {
-              result = zStorageResult;
-              source = zStrategy.name;
+          for (var zsi = 0; zsi < zStorageStrategies.length && !result; zsi += 1) {
+            var zStrategy = zStorageStrategies[zsi];
+            try {
+              console.log('[ZaloMain] getMessageHistory: trying', zStrategy.name, 'for', tryId);
+              var zStorageResult = await withTimeout(zStrategy.fn(), 8000, null);
+              if (Array.isArray(zStorageResult) && zStorageResult.length > 0) {
+                result = zStorageResult;
+                source = zStrategy.name + '(' + tryId + ')';
+              }
+            } catch (zErr) {
+              console.warn('[ZaloMain]', zStrategy.name, 'threw:', zErr.message);
             }
-          } catch (zErr) {
-            console.warn('[ZaloMain]', zStrategy.name, 'threw:', zErr.message);
           }
         }
       }
 
-      // Strategy 1: getCM with FULL 7 parameters
-      for (var si = 0; si < allModules.length && !result; si++) {
-        var mod = allModules[si];
-        if (typeof mod.getCM !== 'function') continue;
-        var modName = mod === _httpModule ? 'httpModule' : 'businessModule';
-        console.log('[ZaloMain] getMessageHistory: trying', modName + '.getCM for', isGroup ? 'group' : '1:1', threadId);
-        try {
-          // getCM(conversationId, globalMsgId=0, unknownParam=0, count, reqId, timeout, opts)
-          var reqId = Date.now();
-          var cmPromise = mod.getCM(threadId, 0, 0, count, reqId, 10000, {});
-          result = await withTimeout(cmPromise, 15000, null);
-          if (result) source = modName + '.getCM';
-        } catch (e) {
-          console.warn('[ZaloMain]', modName + '.getCM threw:', e.message);
+      // Strategy 1: getCM with FULL 7 parameters — try all threadId variants
+      for (var tidx1 = 0; tidx1 < threadIdsToTry.length && !result; tidx1++) {
+        var tryId1 = threadIdsToTry[tidx1];
+        for (var si = 0; si < allModules.length && !result; si++) {
+          var mod = allModules[si];
+          if (typeof mod.getCM !== 'function') continue;
+          var modName = mod === _httpModule ? 'httpModule' : 'businessModule';
+          console.log('[ZaloMain] getMessageHistory: trying', modName + '.getCM for', isGroup ? 'group' : '1:1', tryId1);
+          try {
+            var reqId = Date.now();
+            var cmPromise = mod.getCM(tryId1, 0, 0, count, reqId, 10000, {});
+            result = await withTimeout(cmPromise, 15000, null);
+            if (result) source = modName + '.getCM(' + tryId1 + ')';
+          } catch (e) {
+            console.warn('[ZaloMain]', modName + '.getCM threw:', e.message);
+          }
         }
       }
 
