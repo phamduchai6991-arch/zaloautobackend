@@ -100,7 +100,7 @@
           fromId: String(msg.uidFrom || msg.fromUid || msg.fromId || msg.senderId || msg.uid || ''),
           toId: String(msg.idTo || msg.toId || msg.toUid || ''),
           content: extractMessageContent(msg) || '[Tin nhắn không có nội dung]',
-          rawContent: msg.content || null,
+          rawContent: getRawMessageContent(msg),
           ts: Number(msg.ts || 0),
           msgType: msg.msgType || msg.type || 'text',
           dName: msg.dName || '',
@@ -170,7 +170,7 @@
   // Preserve prototype chain
   window.WebSocket.prototype = _OrigWebSocket.prototype;
   window.WebSocket.CONNECTING = _OrigWebSocket.CONNECTING;
-  window.WebSocket.OPEN = _OrigWebSocket.OPEN;
+      rawContent: getRawMessageContent(msg),
   window.WebSocket.CLOSING = _OrigWebSocket.CLOSING;
   window.WebSocket.CLOSED = _OrigWebSocket.CLOSED;
 
@@ -982,7 +982,7 @@
     for (var candidateIndex = 0; candidateIndex < directCandidates.length; candidateIndex += 1) {
       var directText = toReadableText(directCandidates[candidateIndex]);
       if (directText) {
-        if (candidateIndex >= 8) {
+        if (candidateIndex >= 13) {
           return '[Liên kết] ' + directText;
         }
         return directText;
@@ -1049,6 +1049,16 @@
     if (fallbackLabel) return fallbackLabel;
 
     return '';
+  }
+
+  function getRawMessageContent(message) {
+    if (!message || typeof message !== 'object') return null;
+    if (message.content != null) return message.content;
+    if (message.message != null) return message.message;
+    if (message.msg != null) return message.msg;
+    if (message.data != null) return message.data;
+    if (message.params != null) return message.params;
+    return null;
   }
 
   function getConversationLastMessage(conversation) {
@@ -1360,6 +1370,35 @@
   // Extract message array from various Zalo API response shapes
   function extractMessages(result) {
     if (!result) return [];
+
+    function extractFromParsedEnvelope(parsed) {
+      if (!parsed || typeof parsed !== 'object') return [];
+      if (Array.isArray(parsed.msgs)) return parsed.msgs;
+      if (Array.isArray(parsed.groupMsgs)) return parsed.groupMsgs;
+      if (Array.isArray(parsed.messages)) return parsed.messages;
+      if (parsed.data && typeof parsed.data === 'object') {
+        if (Array.isArray(parsed.data.msgs)) return parsed.data.msgs;
+        if (Array.isArray(parsed.data.groupMsgs)) return parsed.data.groupMsgs;
+        if (Array.isArray(parsed.data.messages)) return parsed.data.messages;
+      }
+      return [];
+    }
+
+    function tryDecodeEnvelope(payload, label) {
+      if (typeof payload !== 'string' || payload.length <= 10) return [];
+      if (!_encoderModule || typeof _encoderModule.decodeAES !== 'function') return [];
+      try {
+        var decrypted = _encoderModule.decodeAES(payload);
+        if (!decrypted) return [];
+        var parsed = JSON.parse(decrypted);
+        console.log('[ZaloMain] extractMessages: decrypted ' + label + ', keys:', Object.keys(parsed));
+        return extractFromParsedEnvelope(parsed);
+      } catch (e) {
+        console.warn('[ZaloMain] extractMessages: AES decrypt failed for ' + label + ':', e.message);
+        return [];
+      }
+    }
+
     // Most Zalo APIs return { msgs: [...] } or { groupMsgs: [...] }
     if (Array.isArray(result.msgs)) return result.msgs;
     if (Array.isArray(result.groupMsgs)) return result.groupMsgs;
@@ -1373,24 +1412,17 @@
         if (Array.isArray(result.data.data.msgs)) return result.data.data.msgs;
         if (Array.isArray(result.data.data.groupMsgs)) return result.data.data.groupMsgs;
       }
+
+      // Axios-style envelope: { data: { error_code, data: '<encrypted>' } }
+      if (typeof result.data.data === 'string') {
+        var axiosDecoded = tryDecodeEnvelope(result.data.data, 'result.data.data');
+        if (axiosDecoded.length) return axiosDecoded;
+      }
     }
     // Handle AES-encrypted data string: { error_code, data: "<encrypted>" }
-    if (typeof result.data === 'string' && result.data.length > 10 && _encoderModule && typeof _encoderModule.decodeAES === 'function') {
-      try {
-        var decrypted = _encoderModule.decodeAES(result.data);
-        if (decrypted) {
-          var parsed = JSON.parse(decrypted);
-          console.log('[ZaloMain] extractMessages: decrypted AES data, keys:', Object.keys(parsed));
-          if (parsed.data && typeof parsed.data === 'object') {
-            if (Array.isArray(parsed.data.msgs)) return parsed.data.msgs;
-            if (Array.isArray(parsed.data.groupMsgs)) return parsed.data.groupMsgs;
-          }
-          if (Array.isArray(parsed.msgs)) return parsed.msgs;
-          if (Array.isArray(parsed.groupMsgs)) return parsed.groupMsgs;
-        }
-      } catch (e) {
-        console.warn('[ZaloMain] extractMessages: AES decrypt failed:', e.message);
-      }
+    if (typeof result.data === 'string') {
+      var decoded = tryDecodeEnvelope(result.data, 'result.data');
+      if (decoded.length) return decoded;
     }
     if (Array.isArray(result.data)) return result.data;
     if (Array.isArray(result.messages)) return result.messages;
@@ -1402,10 +1434,9 @@
 
   function normalizeMessage(msg) {
     if (!msg || typeof msg !== 'object') return null;
-    // Guard: skip non-message objects (e.g. metadata values like numbers/strings leaked through)
     if (typeof msg === 'number' || typeof msg === 'string') return null;
     // Must have at least one message-like field
-    if (!msg.msgId && !msg.globalMsgId && !msg.actionId && !msg.cliMsgId && !msg.uidFrom && !msg.content && !msg.msg) return null;
+    if (!msg.msgId && !msg.globalMsgId && !msg.actionId && !msg.cliMsgId && !msg.uidFrom && !msg.fromUid && !msg.content && !msg.msg && !msg.message) return null;
 
     var content = extractMessageContent(msg) || '[Tin nhắn không có nội dung]';
 
@@ -1432,7 +1463,7 @@
       fromId: fromId,
       toId: toId,
       content: content,
-      rawContent: msg.content || null,
+      rawContent: getRawMessageContent(msg),
       ts: ts,
       msgType: msg.msgType || msg.type || 'text',
       status: msg.status || 0,
@@ -2852,7 +2883,6 @@
     }
 
     var callId = e.data.callId;
-    if (!callId) return;
 
     executeApiCall(e.data.method, e.data.args || {})
       .then(function (data) {
