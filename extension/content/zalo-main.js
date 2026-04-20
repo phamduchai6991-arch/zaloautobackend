@@ -1705,11 +1705,10 @@
       msgId = 'gen_' + (msg.ts || Date.now()) + '_' + (fromId || 'x') + '_' + Math.random().toString(36).substr(2, 6);
     }
 
-    var ts = Number(msg.ts || msg.sendDttm || msg.createTime || msg.time || 0);
-    // Zalo sometimes returns ts as a string
-    if (typeof msg.ts === 'string' && msg.ts.length > 0) {
-      ts = Number(msg.ts);
-    }
+    var ts = normalizeTimestamp(msg.ts || msg.sendDttm || msg.createTime || msg.time || 0);
+
+    // Sender display name — Zalo puts it in dName, senderName, or various other fields
+    var senderName = msg.dName || msg.senderName || msg.fromName || msg.displayName || msg.userName || '';
 
     return {
       msgId: msgId,
@@ -1721,7 +1720,7 @@
       msgType: msg.msgType || msg.type || 'text',
       status: msg.status || 0,
       cliMsgId: String(msg.cliMsgId || ''),
-      dName: msg.dName || '',
+      dName: senderName,
       quote: msg.quote || null,
     };
   }
