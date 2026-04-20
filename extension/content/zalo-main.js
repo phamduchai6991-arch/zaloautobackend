@@ -1100,12 +1100,49 @@
 
     try {
       var conversations = await withTimeout(zs.getConversations(), 2000, []);
-      return toArray(conversations)
+      var items = toArray(conversations)
         .map(normalizeConversationItem)
         .filter(Boolean)
         .sort(function (left, right) {
           return Number(right.lastMsgTime || 0) - Number(left.lastMsgTime || 0);
         });
+
+      // Resolve display names for conversations that have no name
+      if (initWebpackApi()) {
+        var unknownIds = items
+          .filter(function (c) { return !c.isGroup && (!c.displayName || c.displayName === 'Không rõ tên'); })
+          .map(function (c) { return c.id || c.rawId || c.userId; })
+          .filter(Boolean);
+
+        if (unknownIds.length > 0) {
+          try {
+            var versionedIds = unknownIds.map(normalizeMemberVersionKey).filter(Boolean);
+            var profileResult = await withTimeout(
+              callFirstAvailableMethod(['getUserInfo'], [versionedIds]),
+              8000, null
+            );
+            if (profileResult && profileResult.changed_profiles) {
+              var profiles = profileResult.changed_profiles;
+              for (var i = 0; i < items.length; i++) {
+                var conv = items[i];
+                if (conv.isGroup || (conv.displayName && conv.displayName !== 'Không rõ tên')) continue;
+                var cid = conv.id || conv.rawId || conv.userId;
+                var profile = profiles[cid] || profiles[cid + '_0'] || profiles[normalizeMemberVersionKey(cid)];
+                if (profile) {
+                  items[i] = Object.assign({}, conv, {
+                    displayName: profile.displayName || profile.zaloName || profile.username || profile.name || conv.displayName,
+                    avatar: profile.avatar || profile.avatarUrl || conv.avatar,
+                  });
+                }
+              }
+            }
+          } catch (e) {
+            console.warn('[ZaloMain] getConversationList name resolution failed:', e.message);
+          }
+        }
+      }
+
+      return items;
     } catch (_) {
       return [];
     }
@@ -1151,7 +1188,10 @@
           // Log raw structure to understand response format
           console.log('[ZaloMain] getCM raw keys:', Object.keys(cmResult));
           if (cmResult.msgs) console.log('[ZaloMain] getCM msgs count:', cmResult.msgs.length, 'sample:', cmResult.msgs[0] ? Object.keys(cmResult.msgs[0]) : 'empty');
-          if (cmResult.data) console.log('[ZaloMain] getCM data:', typeof cmResult.data, Array.isArray(cmResult.data) ? cmResult.data.length : '');
+          if (cmResult.data && typeof cmResult.data === 'object') {
+            console.log('[ZaloMain] getCM data type:', typeof cmResult.data, Array.isArray(cmResult.data) ? 'array(' + cmResult.data.length + ')' : 'keys:' + Object.keys(cmResult.data).join(','));
+            if (cmResult.data.msgs) console.log('[ZaloMain] getCM data.msgs count:', cmResult.data.msgs.length, 'sample:', cmResult.data.msgs[0] ? Object.keys(cmResult.data.msgs[0]) : 'empty');
+          }
           
           var cmMsgs = extractMessages(cmResult);
           var cmArr = cmMsgs.map(normalizeMessage).filter(Boolean);
@@ -1196,16 +1236,26 @@
     // Most Zalo APIs return { msgs: [...] } or { groupMsgs: [...] }
     if (Array.isArray(result.msgs)) return result.msgs;
     if (Array.isArray(result.groupMsgs)) return result.groupMsgs;
+    // Handle two-layer response: { error_code, data: { msgs: [...] } }
+    if (result.data && typeof result.data === 'object' && !Array.isArray(result.data)) {
+      if (Array.isArray(result.data.msgs)) return result.data.msgs;
+      if (Array.isArray(result.data.groupMsgs)) return result.data.groupMsgs;
+      if (Array.isArray(result.data.messages)) return result.data.messages;
+    }
     if (Array.isArray(result.data)) return result.data;
     if (Array.isArray(result.messages)) return result.messages;
     // If result itself is an array
     if (Array.isArray(result)) return result;
-    // If result is a Map or object with numeric-ish keys
-    return toArray(result);
+    // Don't use toArray — it converts metadata fields into fake messages
+    return [];
   }
 
   function normalizeMessage(msg) {
     if (!msg || typeof msg !== 'object') return null;
+    // Guard: skip non-message objects (e.g. metadata values like numbers/strings leaked through)
+    if (typeof msg === 'number' || typeof msg === 'string') return null;
+    // Must have at least one message-like field
+    if (!msg.msgId && !msg.globalMsgId && !msg.actionId && !msg.cliMsgId && !msg.uidFrom && !msg.content && !msg.msg) return null;
 
     var content = extractMessageContent(msg) || '[Tin nhắn không có nội dung]';
 
