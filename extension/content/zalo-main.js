@@ -1156,8 +1156,9 @@
 
     count = Number(count) || 20;
     var httpMod = _httpModule || _businessModule;
+    var bizMod = _businessModule;
 
-    if (!httpMod) {
+    if (!httpMod && !bizMod) {
       console.warn('[ZaloMain] getMessageHistory: no httpModule or businessModule available');
       return [];
     }
@@ -1165,61 +1166,117 @@
     // Log all available message-related methods (first time only)
     if (!getMessageHistory._loggedMethods) {
       getMessageHistory._loggedMethods = true;
-      var allMethods = Object.keys(httpMod).filter(function (k) {
-        return typeof httpMod[k] === 'function';
-      }).sort();
-      console.log('[ZaloMain] httpModule methods:', allMethods.join(', '));
-      var msgMethods = allMethods.filter(function (m) {
-        return /msg|message|cm|history|chat|conv/i.test(m);
-      });
-      console.log('[ZaloMain] message-related methods:', msgMethods.join(', '));
+      var mods = [
+        { name: 'httpModule', mod: _httpModule },
+        { name: 'businessModule', mod: _businessModule },
+      ];
+      for (var mi = 0; mi < mods.length; mi++) {
+        if (!mods[mi].mod) continue;
+        var allMethods = Object.keys(mods[mi].mod).filter(function (k) {
+          return typeof mods[mi].mod[k] === 'function';
+        }).sort();
+        console.log('[ZaloMain]', mods[mi].name, 'ALL methods (' + allMethods.length + '):', allMethods.join(', '));
+        var msgMethods = allMethods.filter(function (m) {
+          return /msg|message|cm|history|chat|conv|cloud|sync|recent|fetch|load|get/i.test(m);
+        });
+        console.log('[ZaloMain]', mods[mi].name, 'data-related methods:', msgMethods.join(', '));
+      }
+      // Also log zStorage methods
+      var zs = window.$$afmc && window.$$afmc.zStorage;
+      if (zs) {
+        var zsMethods = Object.keys(zs).filter(function (k) {
+          return typeof zs[k] === 'function';
+        }).sort();
+        console.log('[ZaloMain] zStorage ALL methods (' + zsMethods.length + '):', zsMethods.join(', '));
+      }
     }
 
     try {
       var result = null;
       var source = '';
+      var allModules = [httpMod, bizMod].filter(function (m, i, arr) { return m && arr.indexOf(m) === i; });
 
-      // Strategy 1: getCM — works for both 1:1 and groups (cloud messages)
-      if (typeof httpMod.getCM === 'function') {
-        console.log('[ZaloMain] getMessageHistory: trying getCM for', isGroup ? 'group' : '1:1', threadId);
+      // Strategy 1: getCM with FULL 7 parameters
+      for (var si = 0; si < allModules.length && !result; si++) {
+        var mod = allModules[si];
+        if (typeof mod.getCM !== 'function') continue;
+        var modName = mod === _httpModule ? 'httpModule' : 'businessModule';
+        console.log('[ZaloMain] getMessageHistory: trying', modName + '.getCM for', isGroup ? 'group' : '1:1', threadId);
         try {
-          result = await withTimeout(httpMod.getCM(threadId, 0, 0, count), 12000, null);
-          source = 'getCM';
+          // getCM(conversationId, globalMsgId=0, unknownParam=0, count, reqId, timeout, opts)
+          var reqId = Date.now();
+          var cmPromise = mod.getCM(threadId, 0, 0, count, reqId, 10000, {});
+          result = await withTimeout(cmPromise, 15000, null);
+          if (result) source = modName + '.getCM';
         } catch (e) {
-          console.warn('[ZaloMain] getCM threw:', e.message);
+          console.warn('[ZaloMain]', modName + '.getCM threw:', e.message);
         }
       }
 
-      // Strategy 2: getHistoryMessage — alternate method
-      if (!result && typeof httpMod.getHistoryMessage === 'function') {
-        console.log('[ZaloMain] getMessageHistory: trying getHistoryMessage for', threadId);
+      // Strategy 2: getHistoryMessage (for groups especially)
+      for (var si2 = 0; si2 < allModules.length && !result; si2++) {
+        var mod2 = allModules[si2];
+        if (typeof mod2.getHistoryMessage !== 'function') continue;
+        var modName2 = mod2 === _httpModule ? 'httpModule' : 'businessModule';
+        console.log('[ZaloMain] getMessageHistory: trying', modName2 + '.getHistoryMessage for', threadId);
         try {
-          result = await withTimeout(httpMod.getHistoryMessage(threadId, count), 12000, null);
-          source = 'getHistoryMessage';
+          result = await withTimeout(mod2.getHistoryMessage(threadId, count), 12000, null);
+          if (result) source = modName2 + '.getHistoryMessage';
         } catch (e) {
-          console.warn('[ZaloMain] getHistoryMessage threw:', e.message);
+          console.warn('[ZaloMain]', modName2 + '.getHistoryMessage threw:', e.message);
         }
       }
 
-      // Strategy 3: Try businessModule if httpModule didn't work
-      if (!result && _businessModule && _businessModule !== httpMod) {
-        if (typeof _businessModule.getCM === 'function') {
-          console.log('[ZaloMain] getMessageHistory: trying businessModule.getCM');
-          try {
-            result = await withTimeout(_businessModule.getCM(threadId, 0, 0, count), 12000, null);
-            source = 'businessModule.getCM';
-          } catch (e) {
-            console.warn('[ZaloMain] businessModule.getCM threw:', e.message);
-          }
+      // Strategy 3: syncCloudMsgFirstLogin — bulk sync method
+      for (var si3 = 0; si3 < allModules.length && !result; si3++) {
+        var mod3 = allModules[si3];
+        if (typeof mod3.syncCloudMsgFirstLogin !== 'function') continue;
+        var modName3 = mod3 === _httpModule ? 'httpModule' : 'businessModule';
+        console.log('[ZaloMain] getMessageHistory: trying', modName3 + '.syncCloudMsgFirstLogin for', threadId);
+        try {
+          result = await withTimeout(mod3.syncCloudMsgFirstLogin([threadId], 0), 12000, null);
+          if (result) source = modName3 + '.syncCloudMsgFirstLogin';
+        } catch (e) {
+          console.warn('[ZaloMain]', modName3 + '.syncCloudMsgFirstLogin threw:', e.message);
         }
-        if (!result && typeof _businessModule.getHistoryMessage === 'function') {
-          console.log('[ZaloMain] getMessageHistory: trying businessModule.getHistoryMessage');
+      }
+
+      // Strategy 4: getCloudMessageJump — alternate fetch method
+      for (var si4 = 0; si4 < allModules.length && !result; si4++) {
+        var mod4 = allModules[si4];
+        if (typeof mod4.getCloudMessageJump !== 'function') continue;
+        var modName4 = mod4 === _httpModule ? 'httpModule' : 'businessModule';
+        console.log('[ZaloMain] getMessageHistory: trying', modName4 + '.getCloudMessageJump for', threadId);
+        try {
+          var jumpReqId = Date.now();
+          result = await withTimeout(mod4.getCloudMessageJump(threadId, 0, count, jumpReqId, false, 10000, {}), 12000, null);
+          if (result) source = modName4 + '.getCloudMessageJump';
+        } catch (e) {
+          console.warn('[ZaloMain]', modName4 + '.getCloudMessageJump threw:', e.message);
+        }
+      }
+
+      // Strategy 5: Scan ALL webpack modules for any with getCM or getMsg* methods
+      if (!result && _wr && _wr.c) {
+        console.log('[ZaloMain] getMessageHistory: scanning webpack cache for message modules...');
+        var cacheKeys = Object.keys(_wr.c);
+        for (var ck = 0; ck < cacheKeys.length && !result; ck++) {
           try {
-            result = await withTimeout(_businessModule.getHistoryMessage(threadId, count), 12000, null);
-            source = 'businessModule.getHistoryMessage';
-          } catch (e) {
-            console.warn('[ZaloMain] businessModule.getHistoryMessage threw:', e.message);
-          }
+            var cachedMod = _wr.c[cacheKeys[ck]];
+            var exp = cachedMod && cachedMod.exports;
+            var def = exp && (exp.default || exp);
+            if (!def || def === httpMod || def === bizMod) continue;
+            if (typeof def.getCM === 'function') {
+              console.log('[ZaloMain] Found getCM on alternate module:', cacheKeys[ck]);
+              try {
+                var altReqId = Date.now();
+                result = await withTimeout(def.getCM(threadId, 0, 0, count, altReqId, 10000, {}), 10000, null);
+                if (result) source = 'altModule(' + cacheKeys[ck] + ').getCM';
+              } catch (e2) {
+                console.warn('[ZaloMain] altModule getCM threw:', e2.message);
+              }
+            }
+          } catch (_) {}
         }
       }
 
@@ -1233,18 +1290,15 @@
       if (typeof result === 'object' && result !== null) {
         var topKeys = Object.keys(result);
         console.log('[ZaloMain] result keys:', topKeys.join(', '));
-        // Log first 500 chars of stringified result for debugging
         try {
-          var preview = JSON.stringify(result).slice(0, 500);
+          var preview = JSON.stringify(result).slice(0, 800);
           console.log('[ZaloMain] result preview:', preview);
         } catch (_) {}
-
-        // Check nested data
         if (result.data && typeof result.data === 'object') {
           console.log('[ZaloMain] result.data keys:', Object.keys(result.data).join(', '));
-          if (result.data.data && typeof result.data.data === 'object') {
-            console.log('[ZaloMain] result.data.data keys:', Object.keys(result.data.data).join(', '));
-          }
+        }
+        if (typeof result.data === 'string') {
+          console.log('[ZaloMain] result.data is STRING, length:', result.data.length, 'first 100:', result.data.slice(0, 100));
         }
       }
 
@@ -2464,40 +2518,64 @@
           hasBusinessModule: !!_businessModule,
           hasEncoderModule: !!_encoderModule,
           httpModuleMethods: [],
+          businessModuleMethods: [],
+          zStorageMethods: [],
           getCMAvailable: false,
           getHistoryMessageAvailable: false,
+          syncCloudMsgAvailable: false,
+          getCloudMessageJumpAvailable: false,
           getCMResult: null,
           getCMError: null,
-          getHistoryMessageResult: null,
-          getHistoryMessageError: null,
           extractedCount: 0,
         };
         
-        var httpMod = _httpModule || _businessModule;
-        if (httpMod) {
-          diag.httpModuleMethods = Object.keys(httpMod).filter(function (k) {
-            return typeof httpMod[k] === 'function' && /msg|message|cm|history|chat|conv|cloud|sync/i.test(k);
+        var diagMods = [
+          { name: 'httpModule', mod: _httpModule },
+          { name: 'businessModule', mod: _businessModule },
+        ];
+        for (var dmi = 0; dmi < diagMods.length; dmi++) {
+          var dm = diagMods[dmi];
+          if (!dm.mod) continue;
+          var methods = Object.keys(dm.mod).filter(function (k) {
+            return typeof dm.mod[k] === 'function';
           }).sort();
-          diag.getCMAvailable = typeof httpMod.getCM === 'function';
-          diag.getHistoryMessageAvailable = typeof httpMod.getHistoryMessage === 'function';
+          diag[dm.name + 'Methods'] = methods;
+        }
+        
+        var diagZs = window.$$afmc && window.$$afmc.zStorage;
+        if (diagZs) {
+          diag.zStorageMethods = Object.keys(diagZs).filter(function (k) {
+            return typeof diagZs[k] === 'function';
+          }).sort();
+        }
+
+        var diagHttpMod = _httpModule || _businessModule;
+        if (diagHttpMod) {
+          diag.getCMAvailable = typeof diagHttpMod.getCM === 'function';
+          diag.getHistoryMessageAvailable = typeof diagHttpMod.getHistoryMessage === 'function';
+          diag.syncCloudMsgAvailable = typeof diagHttpMod.syncCloudMsgFirstLogin === 'function';
+          diag.getCloudMessageJumpAvailable = typeof diagHttpMod.getCloudMessageJump === 'function';
           
           if (diagThreadId && diag.getCMAvailable) {
             try {
-              var diagCM = await withTimeout(httpMod.getCM(diagThreadId, 0, 0, diagCount), 12000, null);
+              var diagReqId = Date.now();
+              var diagCM = await withTimeout(diagHttpMod.getCM(diagThreadId, 0, 0, diagCount, diagReqId, 10000, {}), 15000, null);
               if (diagCM) {
                 diag.getCMResult = {
                   type: typeof diagCM,
                   keys: Object.keys(diagCM),
-                  preview: JSON.stringify(diagCM).slice(0, 1000),
+                  preview: JSON.stringify(diagCM).slice(0, 1500),
                   dataType: diagCM.data ? typeof diagCM.data : 'none',
                   dataKeys: diagCM.data && typeof diagCM.data === 'object' ? Object.keys(diagCM.data) : [],
+                  dataStringLength: typeof diagCM.data === 'string' ? diagCM.data.length : 0,
                   errorCode: diagCM.error_code,
+                  errorMessage: diagCM.error_message,
                 };
                 var diagMsgs = extractMessages(diagCM);
                 diag.extractedCount = diagMsgs.length;
                 if (diagMsgs.length > 0) {
                   diag.firstMessageKeys = Object.keys(diagMsgs[0]);
-                  diag.firstMessagePreview = JSON.stringify(diagMsgs[0]).slice(0, 300);
+                  diag.firstMessagePreview = JSON.stringify(diagMsgs[0]).slice(0, 500);
                 }
               } else {
                 diag.getCMResult = 'null (timeout or empty)';
