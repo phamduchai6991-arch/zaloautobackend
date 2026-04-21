@@ -1616,6 +1616,18 @@
         if (Array.isArray(parsed.data.groupMsgs)) return parsed.data.groupMsgs;
         if (Array.isArray(parsed.data.messages)) return parsed.data.messages;
       }
+      // Layer 3: parsed.data is a JSON string (getCM 3-layer structure)
+      // decodeAES → {error_code, data: "<JSON string>"} → JSON.parse(data) → {groupMsgs|msgs}
+      if (typeof parsed.data === 'string' && parsed.data.length > 2) {
+        try {
+          var inner = JSON.parse(parsed.data);
+          if (inner && typeof inner === 'object') {
+            if (Array.isArray(inner.msgs)) return inner.msgs;
+            if (Array.isArray(inner.groupMsgs)) return inner.groupMsgs;
+            if (Array.isArray(inner.messages)) return inner.messages;
+          }
+        } catch (e) { /* ignore parse errors */ }
+      }
       return [];
     }
 
