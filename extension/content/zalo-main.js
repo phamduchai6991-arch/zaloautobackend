@@ -1246,10 +1246,34 @@
       var conversations = await withTimeout(zs.getConversations(), 2000, []);
       var items = toArray(conversations)
         .map(normalizeConversationItem)
-        .filter(Boolean)
-        .sort(function (left, right) {
-          return Number(right.lastMsgTime || 0) - Number(left.lastMsgTime || 0);
-        });
+        .filter(Boolean);
+
+      // Also fetch groups separately — getConversations() often omits them
+      if (typeof zs.getGroups === 'function') {
+        try {
+          var groups = await withTimeout(zs.getGroups(), 2000, []);
+          var groupItems = toArray(groups)
+            .map(function (g) {
+              // Force isGroup flag for raw group objects
+              return normalizeConversationItem(Object.assign({}, g, { isGroup: true }));
+            })
+            .filter(Boolean);
+
+          if (groupItems.length > 0) {
+            // Merge: avoid duplicates by id
+            var existingIds = new Set(items.map(function (c) { return c.id; }));
+            var newGroups = groupItems.filter(function (g) { return g.id && !existingIds.has(g.id); });
+            items = items.concat(newGroups);
+            console.log('[ZaloMain] getConversationList: merged', newGroups.length, 'groups from getGroups()');
+          }
+        } catch (ge) {
+          console.warn('[ZaloMain] getConversationList: getGroups() failed:', ge.message);
+        }
+      }
+
+      items = items.sort(function (left, right) {
+        return Number(right.lastMsgTime || 0) - Number(left.lastMsgTime || 0);
+      });
 
       // Resolve display names for conversations that have no name
       if (initWebpackApi()) {
