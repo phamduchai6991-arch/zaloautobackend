@@ -639,6 +639,35 @@
     });
   }
 
+  function getCurrentConversationTitle() {
+    // Find the conversation header title in Zalo Web
+    // It's typically in the right half of the screen, near the top
+    var candidates = Array.from(document.querySelectorAll('h1, h2, h3, h4, [class*="header"] span, [class*="title"], [class*="name"], [class*="Header"] span'))
+      .filter(isVisibleElement)
+      .filter(function (el) {
+        var rect = el.getBoundingClientRect();
+        return rect.left > window.innerWidth * 0.3 &&
+               rect.top < window.innerHeight * 0.2 &&
+               rect.width > 60 &&
+               rect.height > 10;
+      })
+      .sort(function (a, b) {
+        // Prefer larger elements closer to top
+        var aRect = a.getBoundingClientRect();
+        var bRect = b.getBoundingClientRect();
+        return (aRect.top - bRect.top) || (bRect.width - aRect.width);
+      });
+    return candidates.length > 0 ? (getElementText(candidates[0]) || '').trim() : '';
+  }
+
+  function conversationTitleMatches(currentTitle, expectedName, expectedId) {
+    if (!currentTitle) return true; // can't verify, allow through
+    var normalizedCurrent = normalizeText(currentTitle);
+    if (expectedName && normalizeText(expectedName) && normalizedCurrent.indexOf(normalizeText(expectedName)) !== -1) return true;
+    if (expectedId && normalizedCurrent.indexOf(normalizeText(String(expectedId))) !== -1) return true;
+    return false;
+  }
+
   function mergeApiHistoryWithDom(apiMessages, domMessages) {
     if (!Array.isArray(domMessages) || domMessages.length === 0) {
       return Array.isArray(apiMessages) ? apiMessages : [];
@@ -667,17 +696,25 @@
     var args = request && request.args ? request.args : {};
     var metaConversation = request && request.meta && request.meta.conversation ? request.meta.conversation : {};
     var threadId = args.threadId || metaConversation.id || metaConversation.rawId || '';
+    var expectedName = metaConversation.displayName || metaConversation.name || '';
     var count = Number(args.count) || 20;
 
     await openConversation({
       zid: threadId,
-      name: metaConversation.displayName || metaConversation.name || '',
+      name: expectedName,
       phone: metaConversation.phone || '',
       isGroup: !!args.isGroup,
       sourceTab: args.isGroup ? 'group' : 'friend',
     });
 
-    await sleep(1200);
+    await sleep(1500);
+
+    // Verify the correct conversation was opened before scraping
+    var currentTitle = getCurrentConversationTitle();
+    if (currentTitle && expectedName && !conversationTitleMatches(currentTitle, expectedName, threadId)) {
+      console.warn('[ZaloBridge] getMessageHistoryViaDom: opened wrong conversation. Expected:', expectedName, 'Got:', currentTitle);
+      throw new Error('Zalo Web đang hiển thị sai hội thoại ("' + currentTitle + '" thay vì "' + expectedName + '"). Bỏ qua DOM scraping.');
+    }
 
     var searchInput = findSearchInput();
     var pane = findMessagePane(searchInput);
