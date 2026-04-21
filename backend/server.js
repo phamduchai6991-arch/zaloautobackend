@@ -1159,6 +1159,81 @@ const server = createServer(async (req, res) => {
         return handleAccountSync(req, res, body);
       }
 
+      // POST /api/zalo/conversations — get recent conversation list via Zalo HTTP API (no browser tab)
+      if (req.method === 'POST' && url === '/api/zalo/conversations') {
+        const body = await readBody(req);
+        let account = body?.account;
+        if (!account) return writeJson(res, 400, { ok: false, error: 'Thiếu account.' });
+
+        // Enrich from DB if needed
+        try {
+          const hasCookies = Boolean(
+            (Array.isArray(account?.cookies) && account.cookies.length > 0) ||
+            (typeof account?.cookie === 'string' && account.cookie.trim()),
+          );
+          if (!hasCookies && account.ownerUserId && (account.id || account.zaloId || account.userId)) {
+            const zaloId = account.id || account.zaloId || account.userId;
+            const dbAccount = await getAccount(account.ownerUserId, zaloId);
+            if (dbAccount) Object.assign(account, dbAccount);
+          }
+        } catch (_) {}
+
+        const userAgent = getUserAgent(body, req);
+        let api;
+        try {
+          ({ api } = await createApiClient(account, userAgent));
+        } catch (error) {
+          return writeJson(res, 500, {
+            ok: false,
+            error: error instanceof Error ? error.message : 'Không thể khởi tạo phiên Zalo.',
+            code: 'SERVICE_LOGIN_FAILED',
+          });
+        }
+
+        try {
+          // Build conversation list from friends + groups (no browser tab needed)
+          // getAllFriends and getAllGroups are already tested and working
+          const [friendsResult, groupsResult] = await Promise.allSettled([
+            api.getAllFriends(),
+            api.getAllGroups(),
+          ]);
+
+          const friends = (friendsResult.status === 'fulfilled' && Array.isArray(friendsResult.value?.friends))
+            ? friendsResult.value.friends
+            : [];
+          const groups = (groupsResult.status === 'fulfilled' && Array.isArray(groupsResult.value?.groups))
+            ? groupsResult.value.groups
+            : [];
+
+          // Normalize to conversation shape
+          const friendConversations = friends.map((f) => ({
+            id: String(f.userId || f.globalId || ''),
+            displayName: f.displayName || f.zaloName || f.username || 'Không rõ tên',
+            avatar: f.avatar || '',
+            isGroup: false,
+            userId: String(f.userId || ''),
+          }));
+
+          const groupConversations = groups.map((g) => ({
+            id: String(g.groupId || g.userId || g.id || ''),
+            displayName: g.name || g.fullName || g.displayName || 'Nhóm không rõ tên',
+            avatar: g.avt || g.avatar || '',
+            isGroup: true,
+            memberCount: g.totalMember || 0,
+          }));
+
+          return writeJson(res, 200, {
+            ok: true,
+            data: [...friendConversations, ...groupConversations],
+          });
+        } catch (error) {
+          return writeJson(res, 500, {
+            ok: false,
+            error: error instanceof Error ? error.message : 'Không lấy được danh sách hội thoại.',
+          });
+        }
+      }
+
       if (req.method === 'POST' && url === '/api/zalo/messages/batch') {
         const body = await readBody(req);
         return handleSendBatchStream(req, res, body);
