@@ -993,30 +993,20 @@
               apiHistoryError = error;
             }
 
-            if (!apiHistoryError && !shouldFallbackMessageHistory(apiHistory)) {
+            // DOM fallback removed — unreliable (clicks wrong conversation, returns group messages).
+            // Strategy 6 (direct HTTP fetch) in zalo-main.js covers the fallback instead.
+            if (!apiHistoryError && Array.isArray(apiHistory) && apiHistory.length > 0) {
               sendResponse({ ok: true, data: apiHistory });
               return;
             }
 
-            try {
-              var domHistory = await getMessageHistoryViaDom(request);
-              var mergedHistory = mergeApiHistoryWithDom(apiHistory, domHistory);
-              console.log('[ZaloBridge] getMessageHistory fallback source:', apiHistoryError ? 'dom-only' : 'api+dom', 'count:', mergedHistory.length);
-              sendResponse({ ok: true, data: mergedHistory });
+            // Return whatever we have, even if empty — avoids showing wrong messages
+            if (!apiHistoryError) {
+              sendResponse({ ok: true, data: apiHistory });
               return;
-            } catch (domError) {
-              if (Array.isArray(apiHistory) && apiHistory.length > 0 && !shouldFallbackMessageHistory(apiHistory)) {
-                console.log('[ZaloBridge] DOM history fallback skipped:', domError.message);
-                sendResponse({ ok: true, data: apiHistory });
-                return;
-              }
-
-              if (Array.isArray(apiHistory) && apiHistory.length > 0) {
-                throw new Error('Zalo API chỉ trả placeholder và DOM fallback thất bại: ' + domError.message);
-              }
-
-              throw (apiHistoryError || domError);
             }
+
+            throw apiHistoryError;
           }
 
           if (request.method === 'debugGetMessageHistory') {

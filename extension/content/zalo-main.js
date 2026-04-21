@@ -1485,6 +1485,76 @@
         }
       }
 
+      // Strategy 6: Direct HTTP fetch to Zalo's cloud message API
+      // This mirrors how zalotool.net works - fetch directly with cookies (no CORS from chat.zalo.me)
+      if (!result && _encoderModule && typeof _encoderModule.encodeAES === 'function' && typeof _encoderModule.decodeAES === 'function') {
+        console.log('[ZaloMain] getMessageHistory: trying direct HTTP fetch strategy for', threadId);
+        try {
+          // Determine IMEI for request authentication
+          var httpImei = '';
+          try {
+            var X4fAMod = _wr && _wr('X4fA');
+            if (X4fAMod && X4fAMod.a && typeof X4fAMod.a.getZaloClientID === 'function') {
+              httpImei = X4fAMod.a.getZaloClientID();
+            }
+          } catch (_) {}
+          if (!httpImei && _httpModule && _httpModule.imei) httpImei = _httpModule.imei;
+          if (!httpImei && _businessModule && _businessModule.imei) httpImei = _businessModule.imei;
+
+          // Get domain: try from httpModule, fallback to known subdomain
+          var cmDomain = '';
+          try {
+            if (_httpModule && typeof _httpModule.getDomainByType === 'function') {
+              // type 10 = getGroupCloudDomain
+              cmDomain = _httpModule.getDomainByType(10);
+            }
+          } catch (_) {}
+          if (!cmDomain) {
+            cmDomain = 'https://tt-group-cm.chat.zalo.me';
+          }
+
+          // Strip trailing slash
+          cmDomain = String(cmDomain || '').replace(/\/$/, '');
+
+          // Build params payload: {groupId, globalMsgId, count, imei}
+          var cmParams = {
+            groupId: threadId,
+            globalMsgId: 0,
+            count: count || 20,
+          };
+          if (httpImei) cmParams.imei = httpImei;
+
+          var encryptedParams = encodeURIComponent(_encoderModule.encodeAES(JSON.stringify(cmParams)));
+          var cmUrl = cmDomain + '/api/cm/getrecentv2?zpw_ver=681&zpw_type=30&params=' + encryptedParams + '&nretry=0';
+
+          console.log('[ZaloMain] getMessageHistory HTTP fetch URL (domain):', cmDomain);
+          var fetchResponse = await withTimeout(
+            fetch(cmUrl, { credentials: 'include', headers: { 'Accept': 'application/json, text/plain, */*' } }),
+            15000,
+            null
+          );
+
+          if (fetchResponse && fetchResponse.ok) {
+            var responseText = await fetchResponse.text();
+            var responseJson = null;
+            try { responseJson = JSON.parse(responseText); } catch (_) {}
+            if (responseJson) {
+              console.log('[ZaloMain] getMessageHistory HTTP fetch response error_code:', responseJson.error_code, 'data type:', typeof responseJson.data);
+              if (responseJson.error_code === 0) {
+                result = responseJson;
+                source = 'directHTTP.getrecentv2';
+              } else {
+                console.warn('[ZaloMain] getMessageHistory HTTP fetch: Zalo error_code', responseJson.error_code);
+              }
+            }
+          } else if (fetchResponse) {
+            console.warn('[ZaloMain] getMessageHistory HTTP fetch: HTTP status', fetchResponse.status);
+          }
+        } catch (httpErr) {
+          console.warn('[ZaloMain] getMessageHistory HTTP fetch threw:', httpErr.message);
+        }
+      }
+
       if (!result) {
         console.warn('[ZaloMain] getMessageHistory: all strategies returned null for', threadId);
         return [];
