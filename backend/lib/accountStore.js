@@ -103,7 +103,14 @@ export async function registerAccount({ userId, planKey, zaloId, zaloName, zaloA
     // Already registered — update info and last_used_at
     const result = await query(
       `UPDATE zalo_accounts SET zalo_name = $3, zalo_avatar = $4, zalo_phone = $5, last_used_at = now(),
-         session_blob = COALESCE($6::jsonb, session_blob),
+         session_blob = CASE
+           WHEN $6::jsonb IS NULL THEN session_blob
+           WHEN (
+             (jsonb_typeof($6::jsonb->'cookies') = 'array' AND jsonb_array_length($6::jsonb->'cookies') > 0)
+             OR (length(COALESCE($6::jsonb->>'cookie', '')) > 0)
+           ) THEN $6::jsonb
+           ELSE session_blob || ($6::jsonb - 'cookies' - 'cookie' - 'imei' - 'decryptKey' - 'commonParams')
+         END,
          sync_status = COALESCE($7, sync_status),
          synced_at = COALESCE($8::timestamptz, synced_at),
          service_synced_at = COALESCE($9::timestamptz, service_synced_at)
