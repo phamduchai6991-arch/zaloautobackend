@@ -99,7 +99,7 @@
           msgId: String(msg.msgId || msg.globalMsgId || msg.actionId || msg.realMsgId || msg.cliMsgId || msg.id || ''),
           fromId: String(msg.uidFrom || msg.fromUid || msg.fromId || msg.senderId || msg.uid || ''),
           toId: String(msg.idTo || msg.toId || msg.toUid || ''),
-          content: extractMessageContent(msg) || '[Tin nhắn không có nội dung]',
+          content: extractMessageContent(msg) || '',
           rawContent: getRawMessageContent(msg),
           ts: Number(msg.ts || 0),
           msgType: msg.msgType || msg.type || 'text',
@@ -985,6 +985,7 @@
 
     var type = String(node.msgType || node.type || node.mediaType || node.attachmentType || '').toLowerCase();
     var containType = Number((node.paramsExt && node.paramsExt.containType) || node.containType || 0);
+    var numType = Number(node.msgType || node.type || 0);
 
     if (node.fileName || node.file_name) return '[File] ' + (node.fileName || node.file_name);
     if (node.thumb || node.thumbSrc || node.hdUrl || node.normalUrl || node.imageUrl || node.photoUrl || node.thumbnail || node.image) return '[Hình ảnh]';
@@ -998,6 +999,16 @@
     if (type.indexOf('photo') !== -1 || containType === 2) return '[Hình ảnh]';
     if (type.indexOf('poll') !== -1) return '[Bình chọn]';
     if (type.indexOf('todo') !== -1) return '[Công việc]';
+
+    // Numeric Zalo msgType fallback
+    if (numType === 2 || numType === 201) return '[Hình ảnh]';
+    if (numType === 3) return '[Sticker]';
+    if (numType === 4) return '[GIF]';
+    if (numType === 6) return '[Video]';
+    if (numType === 7) return '[Âm thanh]';
+    if (numType === 8) return '[Vị trí]';
+    if (numType === 10) return '[Tệp đính kèm]';
+    if (numType === 11) return '[Cuộc gọi]';
 
     return '';
   }
@@ -1805,7 +1816,7 @@
     // Must have at least one message-like field
     if (!msg.msgId && !msg.globalMsgId && !msg.actionId && !msg.cliMsgId && !msg.uidFrom && !msg.fromUid && !msg.content && !msg.msg && !msg.message) return null;
 
-    var content = extractMessageContent(msg) || '[Tin nhắn không có nội dung]';
+    var content = extractMessageContent(msg);
 
     // Zalo uses "0" to mean "self" for both uidFrom and idTo
     var fromId = String(msg.uidFrom || msg.fromUid || msg.fromId || msg.senderId || msg.uid || '');
