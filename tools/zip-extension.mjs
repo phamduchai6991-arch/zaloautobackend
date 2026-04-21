@@ -4,9 +4,10 @@ import { Buffer } from 'node:buffer';
 
 // Minimal ZIP creator — no external deps needed
 // Produces a valid ZIP archive of the extension/ folder
+// Outputs to: frontend/public/autozalo-extension.zip (served for download)
 
 const SRC = join(import.meta.dirname, '..', 'extension');
-const OUT = join(import.meta.dirname, '..', 'autozalo-extension.zip');
+const OUT = join(import.meta.dirname, '..', '..', 'frontend', 'public', 'autozalo-extension.zip');
 
 function collectFiles(dir, base = dir) {
   const results = [];
