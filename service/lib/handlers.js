@@ -1,4 +1,6 @@
 import { MuteAction, MuteDuration, ThreadType } from 'zalo-api-final';
+import { ZaloApiError } from 'zalo-api-final';
+import { decodeAES } from '../../reference/zalo-api-final/dist/utils.js';
 import { createApiClient, getUserAgent } from './apiClient.js';
 import { writeJson } from './http.js';
 import {
@@ -24,7 +26,137 @@ function writeServiceLoginError(res, error) {
   });
 }
 
-function ensureCustomApiActions(api) {
+function getGroupHistoryIdCandidates(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  const candidates = [];
+  const push = (candidate) => {
+    const normalized = String(candidate || '').trim();
+    if (!normalized || candidates.includes(normalized)) return;
+    candidates.push(normalized);
+  };
+
+  if (/^g\d+$/i.test(raw)) {
+    push(raw.slice(1));
+    push(raw);
+    return candidates;
+  }
+
+  if (/^\d+$/.test(raw)) {
+    push(raw);
+    push(`g${raw}`);
+    return candidates;
+  }
+
+  push(raw);
+  return candidates;
+}
+
+function readHistoryMessages(value) {
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return [];
+    try {
+      const parsed = JSON.parse(text);
+      return readHistoryMessages(parsed);
+    } catch (_) {
+      return [];
+    }
+  }
+  if (!value || typeof value !== 'object') return [];
+  if (Array.isArray(value.msgs)) return value.msgs;
+  if (Array.isArray(value.groupMsgs)) return value.groupMsgs;
+  if (Array.isArray(value.messages)) return value.messages;
+  if (value.data && typeof value.data === 'object') {
+    if (Array.isArray(value.data.msgs)) return value.data.msgs;
+    if (Array.isArray(value.data.groupMsgs)) return value.data.groupMsgs;
+    if (Array.isArray(value.data.messages)) return value.data.messages;
+  }
+  return [];
+}
+
+function parseCloudMessagePayload(secretKey, json) {
+  if (!json || typeof json !== 'object') {
+    throw new ZaloApiError('Cloud message response is invalid.');
+  }
+  if (Number(json.error_code) !== 0) {
+    throw new ZaloApiError(json.error_message || 'Cloud message request failed.', json.error_code);
+  }
+
+  if (typeof json.data !== 'string' || !json.data) {
+    return { msgs: [] };
+  }
+
+  const decodedText = decodeAES(secretKey, json.data);
+  const decoded = decodedText ? JSON.parse(decodedText) : null;
+  if (!decoded || typeof decoded !== 'object') {
+    return { msgs: [] };
+  }
+
+  if (Number(decoded.error_code) === 10002 && String(decoded.error_message || '').trim() === 'Successful.') {
+    if (typeof decoded.data === 'string' && decoded.data.trim()) {
+      try {
+        return JSON.parse(decoded.data);
+      } catch (_) {
+        return { msgs: [] };
+      }
+    }
+    return { msgs: [] };
+  }
+
+  if (Number(decoded.error_code) !== 0) {
+    throw new ZaloApiError(decoded.error_message || 'Cloud message decode failed.', decoded.error_code);
+  }
+
+  return decoded.data ?? decoded;
+}
+
+async function requestCloudMessage(api, ctx, utils, endpointPath, props = {}) {
+  const groupIdCandidates = getGroupHistoryIdCandidates(props?.groupId || props?.threadId || props?.conversationId || props);
+  const hostCandidates = [
+    api?.zpwServiceMap?.group_cloud_message?.[0],
+    api?.zpwServiceMap?.conversation?.[0],
+    'https://tt-group-cm.chat.zalo.me',
+  ].map((value) => String(value || '').trim().replace(/\/$/, '')).filter(Boolean);
+
+  let lastError = null;
+  let emptyResult = null;
+
+  for (const host of hostCandidates) {
+    for (const groupId of groupIdCandidates) {
+      try {
+        const serviceURL = utils.makeURL(`${host}${endpointPath}`);
+        const encryptedParams = utils.encodeAES(JSON.stringify({
+          ...props,
+          groupId,
+          imei: ctx.imei,
+        }));
+
+        if (!encryptedParams) {
+          throw new Error('Failed to encrypt params');
+        }
+
+        const response = await utils.request(utils.makeURL(serviceURL, { params: encryptedParams, nretry: 0 }), {
+          method: 'GET',
+        });
+        const json = await response.json();
+        const parsed = parseCloudMessagePayload(ctx.secretKey, json);
+        if (readHistoryMessages(parsed).length > 0) {
+          return parsed;
+        }
+        emptyResult = parsed;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+  }
+
+  if (emptyResult) return emptyResult;
+  if (lastError) throw lastError;
+  throw new ZaloApiError('Không thể đọc lịch sử cloud message.');
+}
+
+export function ensureCustomApiActions(api) {
   if (typeof api?.custom !== 'function') return;
 
   if (typeof api.rejectFriendRequest !== 'function') {
@@ -48,6 +180,122 @@ function ensureCustomApiActions(api) {
       });
 
       return utils.resolve(response);
+    });
+  }
+
+  if (typeof api.getHistoryMessage !== 'function') {
+    api.custom('getHistoryMessage', async ({ ctx, utils, props }) => {
+      const groupId = String(props?.groupId || props?.threadId || props?.conversationId || props || '').trim();
+      const count = Math.max(1, Math.min(200, Number(props?.count) || 30));
+      if (!groupId) {
+        throw new ZaloApiError('Thiếu groupId/threadId để lấy lịch sử nhóm.');
+      }
+
+      const candidates = getGroupHistoryIdCandidates(groupId);
+      let lastError = null;
+
+      for (const candidate of candidates) {
+        const serviceURL = utils.makeURL(`${api.zpwServiceMap.group[0]}/api/group/history`);
+        const encryptedParams = utils.encodeAES(JSON.stringify({
+          grid: candidate,
+          count,
+          imei: ctx.imei,
+        }));
+
+        if (!encryptedParams) {
+          throw new Error('Failed to encrypt params');
+        }
+
+        try {
+          const response = await utils.request(utils.makeURL(serviceURL, { params: encryptedParams }), {
+            method: 'GET',
+          });
+          return await utils.resolve(response);
+        } catch (error) {
+          lastError = error;
+          if (!(error instanceof Error) || !/Tham số không hợp lệ/i.test(error.message || '')) {
+            throw error;
+          }
+        }
+      }
+
+      try {
+        await api.syncCloudMsgFirstLogin({ groupIds: [groupId] });
+        return api.getCM({ groupId, globalMsgId: 0, count });
+      } catch (fallbackError) {
+        if (lastError) throw lastError;
+        throw fallbackError;
+      }
+    });
+  }
+
+  if (typeof api.getCM !== 'function') {
+    api.custom('getCM', async ({ ctx, utils, props }) => {
+      const groupId = String(props?.groupId || props?.threadId || props?.conversationId || props || '').trim();
+      const globalMsgId = Number(props?.globalMsgId) || 0;
+      const count = Math.max(1, Math.min(200, Number(props?.count) || 30));
+      if (!groupId) {
+        throw new ZaloApiError('Thiếu groupId/threadId để lấy cloud message nhóm.');
+      }
+
+      return requestCloudMessage(api, ctx, utils, '/api/cm/getrecentv2', { groupId, globalMsgId, count });
+    });
+  }
+
+  if (typeof api.syncCloudMsgFirstLogin !== 'function') {
+    api.custom('syncCloudMsgFirstLogin', async ({ ctx, utils, props }) => {
+      const groupIds = Array.isArray(props?.groupIds) ? props.groupIds.flatMap((value) => getGroupHistoryIdCandidates(value)) : [];
+      if (!groupIds.length) {
+        throw new ZaloApiError('Thiếu groupIds để sync cloud message.');
+      }
+      return requestCloudMessage(api, ctx, utils, '/api/cm/mget', { groupIds });
+    });
+  }
+
+  if (typeof api.getCloudMessageJump !== 'function') {
+    api.custom('getCloudMessageJump', async ({ ctx, utils, props }) => {
+      const groupId = String(props?.groupId || props?.threadId || props?.conversationId || props || '').trim();
+      const globalMsgId = Number(props?.globalMsgId) || 0;
+      const count = Math.max(1, Math.min(200, Number(props?.count) || 30));
+      const isJump = Boolean(props?.isJump);
+      if (!groupId) {
+        throw new ZaloApiError('Thiếu groupId/threadId để jump cloud message nhóm.');
+      }
+      return requestCloudMessage(api, ctx, utils, '/api/cm/rgetv2', {
+        groupId,
+        globalMsgId,
+        count,
+        isJump,
+      });
+    });
+  }
+
+  if (typeof api.getRecentGroup !== 'function') {
+    api.custom('getRecentGroup', async ({ props }) => {
+      const groupId = String(props?.groupId || props?.threadId || props?.conversationId || props || '').trim();
+      const globalMsgId = Number(props?.globalMsgId) || 0;
+      const count = Math.max(1, Math.min(200, Number(props?.count) || 30));
+      return api.getCM({ groupId, globalMsgId, count });
+    });
+  }
+
+  if (typeof api.getGroupChatHistory !== 'function') {
+    api.custom('getGroupChatHistory', async ({ props }) => {
+      const groupId = String(props?.groupId || props?.threadId || props?.conversationId || props || '').trim();
+      const count = Math.max(1, Math.min(200, Number(props?.count) || 30));
+      return api.getHistoryMessage({ groupId, count });
+    });
+  }
+
+  if (typeof api.getMessageHistory !== 'function') {
+    api.custom('getMessageHistory', async ({ props }) => {
+      const threadId = String(props?.threadId || props?.conversationId || props?.groupId || props || '').trim();
+      const isGroup = Boolean(props?.isGroup);
+      const count = Math.max(1, Math.min(200, Number(props?.count) || 30));
+      if (!isGroup) {
+        throw new ZaloApiError('getMessageHistory custom hiện chỉ hỗ trợ hội thoại nhóm.');
+      }
+      return api.getHistoryMessage({ groupId: threadId, count });
     });
   }
 }

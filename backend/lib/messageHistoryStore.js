@@ -100,6 +100,45 @@ export async function listMessageHistory({ ownerUserId, accountZaloId, conversat
     .reverse();
 }
 
+export async function listLatestConversationMessages({ ownerUserId, accountZaloId, limit = 500 }) {
+  if (!hasDatabaseConfigured()) return [];
+  await ensureMessageHistorySchema();
+
+  const safeLimit = Math.max(1, Math.min(5000, Number(limit) || 500));
+  const result = await query(
+    `SELECT DISTINCT ON (conversation_id)
+        conversation_id,
+        msg_id,
+        from_id,
+        to_id,
+        content,
+        raw_content,
+        msg_type,
+        ts_ms,
+        sender_name,
+        is_group
+       FROM zalo_message_history
+      WHERE owner_user_id = $1
+        AND account_zalo_id = $2
+      ORDER BY conversation_id, ts_ms DESC, updated_at DESC
+      LIMIT $3`,
+    [ownerUserId, accountZaloId, safeLimit],
+  );
+
+  return result.rows.map((row) => ({
+    conversationId: String(row.conversation_id || ''),
+    msgId: String(row.msg_id || ''),
+    fromId: String(row.from_id || ''),
+    toId: String(row.to_id || ''),
+    content: String(row.content || ''),
+    rawContent: row.raw_content ?? null,
+    msgType: String(row.msg_type || 'text'),
+    ts: Number(row.ts_ms || 0),
+    dName: String(row.sender_name || ''),
+    isGroup: Boolean(row.is_group),
+  })).filter((item) => item.conversationId);
+}
+
 export async function upsertMessageHistory({ ownerUserId, accountZaloId, conversationId, isGroup, messages }) {
   if (!hasDatabaseConfigured()) return 0;
   if (!Array.isArray(messages) || messages.length === 0) return 0;

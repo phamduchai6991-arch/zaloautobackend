@@ -53,6 +53,7 @@ import {
 import {
   ensureMessageHistorySchema,
   listMessageHistory,
+  listLatestConversationMessages,
   upsertMessageHistory,
 } from './lib/messageHistoryStore.js';
 import {
@@ -61,6 +62,7 @@ import {
   handleFriendRequestBatch,
   handleGroupInviteTargets,
   handleActionBatch,
+  ensureCustomApiActions,
 } from '../service/lib/handlers.js';
 import { requireAuthenticatedGoogleUser, createSessionToken, verifyGoogleIdToken, verifyGoogleAccessToken } from './lib/googleAuth.js';
 import { createApiClient, getUserAgent } from '../service/lib/apiClient.js';
@@ -166,6 +168,16 @@ function normalizeHistoryMessage(raw) {
 function extractHistoryMessages(result) {
   if (!result) return [];
   if (Array.isArray(result)) return result;
+  if (typeof result === 'string') {
+    const text = result.trim();
+    if (!text) return [];
+    try {
+      const parsed = JSON.parse(text);
+      return extractHistoryMessages(parsed);
+    } catch (_) {
+      return [];
+    }
+  }
   if (typeof result !== 'object') return [];
 
   if (Array.isArray(result.msgs)) return result.msgs;
@@ -209,17 +221,41 @@ function mergeHistoryMessages(...messageLists) {
   return merged.sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
 }
 
+function mapRealtimeChange(row) {
+  return {
+    conversationId: String(row?.conversationId || ''),
+    ts: Number(row?.ts || 0),
+    isGroup: Boolean(row?.isGroup),
+    lastMessage: String(row?.content || ''),
+    lastMsgId: String(row?.msgId || ''),
+    lastMsgType: String(row?.msgType || 'text'),
+    lastSenderId: String(row?.fromId || ''),
+    lastSenderName: String(row?.dName || ''),
+  };
+}
+
+async function buildRealtimeChanges({ ownerUserId, accountZaloId, sinceTs }) {
+  const rows = await listLatestConversationMessages({ ownerUserId, accountZaloId, limit: 1000 });
+  const changed = rows
+    .filter((row) => Number(row?.ts || 0) > sinceTs)
+    .sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0))
+    .map(mapRealtimeChange);
+
+  const maxTs = changed.reduce((max, item) => Math.max(max, Number(item.ts || 0)), sinceTs);
+  return { changed, maxTs };
+}
+
 async function hydrateHistoryFromApi(api, { conversationId, isGroup, count }) {
   const threadId = String(conversationId || '').trim();
   if (!threadId) return [];
 
   const strategies = [
-    async () => (typeof api.getMessageHistory === 'function' ? api.getMessageHistory(threadId, Boolean(isGroup), count) : null),
-    async () => (typeof api.getHistoryMessage === 'function' ? api.getHistoryMessage(threadId, count) : null),
-    async () => (typeof api.getCM === 'function' ? api.getCM(threadId, 0, 0, count, Date.now(), 10000, {}) : null),
+    async () => (typeof api.getMessageHistory === 'function' ? api.getMessageHistory({ threadId, isGroup: Boolean(isGroup), count }) : null),
+    async () => (typeof api.getHistoryMessage === 'function' ? api.getHistoryMessage({ groupId: threadId, count }) : null),
+    async () => (typeof api.getCM === 'function' ? api.getCM({ groupId: threadId, globalMsgId: 0, count }) : null),
     async () => {
       if (!isGroup || typeof api.getRecentGroup !== 'function') return null;
-      return api.getRecentGroup(threadId, 0, count);
+      return api.getRecentGroup({ groupId: threadId, globalMsgId: 0, count });
     },
     async () => {
       if (isGroup || typeof api.getLastMsgs !== 'function') return null;
@@ -368,6 +404,41 @@ async function handleSendBatchStream(req, res, body) {
       const attachFailed = hasAttachments && attachResults.length === 0;
 
       accepted++;
+      try {
+        const ownerUserId = String(account?.ownerUserId || '').trim();
+        const accountZaloId = String(account?.id || account?.zaloId || account?.userId || '').trim();
+        if (ownerUserId && accountZaloId) {
+          const sendTs = Date.now();
+          const sendMsgId = String(
+            apiResult?.message?.msgId
+            || apiResult?.message?.globalMsgId
+            || apiResult?.message?.realMsgId
+            || apiResult?.msgId
+            || apiResult?.globalMsgId
+            || `local_${sendTs}_${String(job?.id || zid)}`
+          );
+
+          await upsertMessageHistory({
+            ownerUserId,
+            accountZaloId,
+            conversationId: zid,
+            isGroup: groupJob,
+            messages: [{
+              msgId: sendMsgId,
+              fromId: accountZaloId,
+              toId: zid,
+              content,
+              rawContent: hasAttachments ? { attachments: true } : null,
+              msgType: hasAttachments ? 'attachment' : 'text',
+              ts: sendTs,
+              dName: String(account?.displayName || account?.name || ''),
+            }],
+          });
+        }
+      } catch (dbErr) {
+        console.warn('[backend] cache sent message failed:', dbErr.message);
+      }
+
       writeNdjsonLine(res, {
         jobId: job.id, ok: true, status: 'sent',
         statusLabel: attachFailed ? 'Đã gửi (tệp lỗi)' : 'Đã gửi',
@@ -428,20 +499,7 @@ async function handleFriendRequestBatchStream(req, res, body) {
     return;
   }
 
-  // ensureCustomApiActions — inline subset needed for friend requests
-  if (typeof api?.custom === 'function' && typeof api.rejectFriendRequest !== 'function') {
-    api.custom('rejectFriendRequest', async ({ ctx, utils, props }) => {
-      const userId = String(props?.userId || props || '').trim();
-      const serviceURL = utils.makeURL(`${api.zpwServiceMap.friend[0]}/api/friend/reject`);
-      const encryptedParams = utils.encodeAES(JSON.stringify({ fid: userId, language: ctx.language }));
-      if (!encryptedParams) throw new Error('Failed to encrypt params');
-      const response = await utils.request(serviceURL, {
-        method: 'POST',
-        body: new URLSearchParams({ params: encryptedParams }),
-      });
-      return utils.resolve(response);
-    });
-  }
+  ensureCustomApiActions(api);
 
   res.writeHead(200, {
     'Content-Type': 'application/x-ndjson',
@@ -730,20 +788,7 @@ async function handleActionBatchStream(req, res, body) {
     return;
   }
 
-  // ensureCustomApiActions inline
-  if (typeof api?.custom === 'function' && typeof api.rejectFriendRequest !== 'function') {
-    api.custom('rejectFriendRequest', async ({ ctx, utils, props }) => {
-      const userId = String(props?.userId || props || '').trim();
-      const serviceURL = utils.makeURL(`${api.zpwServiceMap.friend[0]}/api/friend/reject`);
-      const encryptedParams = utils.encodeAES(JSON.stringify({ fid: userId, language: ctx.language }));
-      if (!encryptedParams) throw new Error('Failed to encrypt params');
-      const response = await utils.request(serviceURL, {
-        method: 'POST',
-        body: new URLSearchParams({ params: encryptedParams }),
-      });
-      return utils.resolve(response);
-    });
-  }
+  ensureCustomApiActions(api);
 
   res.writeHead(200, {
     'Content-Type': 'application/x-ndjson',
@@ -1404,10 +1449,43 @@ const server = createServer(async (req, res) => {
             avatar: g.avatar || '',
             isGroup: true,
             memberCount: Number(g.totalMember || 0),
+            lastMessage: String(g.desc || '').trim() || '',
             lastMsgTime: 0,
           })).filter((item) => item.id);
 
+          const ownerUserId = String(account?.ownerUserId || '').trim();
+          const accountZaloId = String(account?.id || account?.zaloId || account?.userId || '').trim();
+          const latestMessageRows = (ownerUserId && accountZaloId)
+            ? await listLatestConversationMessages({ ownerUserId, accountZaloId, limit: 1000 }).catch(() => [])
+            : [];
+
+          const latestByConversation = new Map();
+          for (const row of latestMessageRows) {
+            const key = String(row.conversationId || '').trim();
+            if (key && !latestByConversation.has(key)) latestByConversation.set(key, row);
+          }
+
+          const attachCachedPreview = (conversation) => {
+            const key = String(conversation?.id || conversation?.rawId || '').trim();
+            if (!key) return conversation;
+            const latest = latestByConversation.get(key);
+            if (!latest) return conversation;
+
+            const nextLastMsgTime = Number(latest.ts || 0) || Number(conversation.lastMsgTime || 0) || 0;
+            const nextPreview = String(latest.content || '').trim();
+            return {
+              ...conversation,
+              lastMsgTime: nextLastMsgTime,
+              lastMessage: nextPreview || conversation.lastMessage || '',
+              lastSenderName: String(latest.dName || ''),
+              lastSenderId: String(latest.fromId || ''),
+              lastMsgId: String(latest.msgId || ''),
+              lastMsgType: String(latest.msgType || 'text'),
+            };
+          };
+
           const data = [...friendConversations, ...groupConversations]
+            .map(attachCachedPreview)
             .sort((a, b) => Number(b.lastMsgTime || 0) - Number(a.lastMsgTime || 0));
 
           return writeJson(res, 200, { ok: true, data });
@@ -1464,6 +1542,7 @@ const server = createServer(async (req, res) => {
         let api;
         try {
           ({ api } = await createApiClient(account, userAgent));
+          ensureCustomApiActions(api);
         } catch (error) {
           if (cachedMessages.length > 0) {
             return writeJson(res, 200, {
@@ -1503,6 +1582,24 @@ const server = createServer(async (req, res) => {
           }
         }
 
+        if (mergedMessages.length === 0) {
+          const fallbackMessage = {
+            msgId: `seed_${conversationId}`,
+            fromId: 'system',
+            toId: conversationId,
+            content: 'Chưa đọc được lịch sử cũ từ Zalo API. Tin nhắn mới phát sinh từ bây giờ sẽ hiển thị ngay tại đây.',
+            rawContent: { type: 'system_notice', reason: 'history_empty' },
+            ts: Date.now(),
+            msgType: 'system',
+            dName: 'Hệ thống',
+          };
+          return writeJson(res, 200, {
+            ok: true,
+            data: [fallbackMessage],
+            source: 'empty-fallback',
+          });
+        }
+
         return writeJson(res, 200, {
           ok: true,
           data: mergedMessages,
@@ -1510,6 +1607,104 @@ const server = createServer(async (req, res) => {
             ? (cachedMessages.length > 0 ? 'db+api' : 'api')
             : (cachedMessages.length > 0 ? 'db' : 'empty'),
         });
+      }
+
+      // POST /api/zalo/realtime/changes — fast delta from backend cache (no extension required)
+      if (req.method === 'POST' && url === '/api/zalo/realtime/changes') {
+        const body = await readBody(req);
+        const account = body?.account;
+        const sinceTs = Math.max(0, Number(body?.sinceTs) || 0);
+
+        if (!account) {
+          return writeJson(res, 400, { ok: false, error: 'Thiếu account.' });
+        }
+
+        const ownerUserId = String(account?.ownerUserId || '').trim();
+        const accountZaloId = String(account?.id || account?.zaloId || account?.userId || '').trim();
+        if (!ownerUserId || !accountZaloId) {
+          return writeJson(res, 400, { ok: false, error: 'Thiếu định danh tài khoản.' });
+        }
+
+        try {
+          const { changed, maxTs } = await buildRealtimeChanges({ ownerUserId, accountZaloId, sinceTs });
+          return writeJson(res, 200, {
+            ok: true,
+            sinceTs,
+            maxTs,
+            changed,
+            serverTs: Date.now(),
+          });
+        } catch (error) {
+          return writeJson(res, 500, {
+            ok: false,
+            error: error instanceof Error ? error.message : 'Không thể đọc cache realtime.',
+          });
+        }
+      }
+
+      // GET /api/zalo/realtime/stream — SSE stream for backend-only realtime updates
+      if (req.method === 'GET' && url === '/api/zalo/realtime/stream') {
+        const ownerUserId = String(fullUrl.searchParams.get('ownerUserId') || '').trim();
+        const accountZaloId = String(
+          fullUrl.searchParams.get('accountZaloId')
+          || fullUrl.searchParams.get('zaloId')
+          || fullUrl.searchParams.get('id')
+          || ''
+        ).trim();
+        let cursorTs = Math.max(0, Number(fullUrl.searchParams.get('sinceTs') || 0));
+
+        if (!ownerUserId || !accountZaloId) {
+          return writeJson(res, 400, { ok: false, error: 'Thiếu ownerUserId/accountZaloId.' });
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        });
+        if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+        const sendEvent = (eventName, payload) => {
+          res.write(`event: ${eventName}\n`);
+          res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        };
+
+        sendEvent('ready', { ok: true, sinceTs: cursorTs, serverTs: Date.now() });
+
+        const timer = setInterval(async () => {
+          if (res.writableEnded || res.destroyed) return;
+          try {
+            const { changed, maxTs } = await buildRealtimeChanges({ ownerUserId, accountZaloId, sinceTs: cursorTs });
+            cursorTs = Math.max(cursorTs, maxTs);
+
+            if (changed.length > 0) {
+              sendEvent('changes', {
+                ok: true,
+                changed,
+                maxTs: cursorTs,
+                serverTs: Date.now(),
+              });
+            } else {
+              // Keep connection alive through intermediaries when no message delta.
+              res.write(`: heartbeat ${Date.now()}\n\n`);
+            }
+          } catch (error) {
+            sendEvent('error', {
+              ok: false,
+              error: error instanceof Error ? error.message : 'Lỗi realtime stream.',
+            });
+          }
+        }, 2000);
+
+        const close = () => {
+          clearInterval(timer);
+          if (!res.writableEnded) res.end();
+        };
+
+        req.on('close', close);
+        req.on('error', close);
+        return;
       }
 
       if (req.method === 'POST' && url === '/api/zalo/messages/batch') {

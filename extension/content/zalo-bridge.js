@@ -984,6 +984,8 @@
           if (request.method === 'getMessageHistory') {
             var apiHistory = [];
             var apiHistoryError = null;
+            var domHistory = [];
+            var domHistoryError = null;
 
             await hydrateConversationForHistory(request);
 
@@ -993,16 +995,40 @@
               apiHistoryError = error;
             }
 
-            // DOM fallback removed — unreliable (clicks wrong conversation, returns group messages).
-            // Strategy 6 (direct HTTP fetch) in zalo-main.js covers the fallback instead.
+            if (apiHistoryError || shouldFallbackMessageHistory(apiHistory)) {
+              try {
+                domHistory = await getMessageHistoryViaDom(request);
+              } catch (error) {
+                domHistoryError = error;
+              }
+            }
+
+            if (Array.isArray(domHistory) && domHistory.length > 0) {
+              if (apiHistoryError || !Array.isArray(apiHistory) || apiHistory.length === 0) {
+                sendResponse({ ok: true, data: domHistory, source: 'dom' });
+                return;
+              }
+
+              sendResponse({ ok: true, data: mergeApiHistoryWithDom(apiHistory, domHistory), source: 'api+dom' });
+              return;
+            }
+
             if (!apiHistoryError && Array.isArray(apiHistory) && apiHistory.length > 0) {
               sendResponse({ ok: true, data: apiHistory });
               return;
             }
 
-            // Return whatever we have, even if empty — avoids showing wrong messages
+            if (!apiHistoryError && domHistoryError) {
+              sendResponse({ ok: true, data: apiHistory, warning: domHistoryError.message, source: 'api-empty' });
+              return;
+            }
+
+            if (apiHistoryError && domHistoryError) {
+              throw new Error(apiHistoryError.message + '. DOM fallback thất bại: ' + domHistoryError.message);
+            }
+
             if (!apiHistoryError) {
-              sendResponse({ ok: true, data: apiHistory });
+              sendResponse({ ok: true, data: apiHistory, source: 'api-empty' });
               return;
             }
 
