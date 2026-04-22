@@ -170,7 +170,7 @@
   // Preserve prototype chain
   window.WebSocket.prototype = _OrigWebSocket.prototype;
   window.WebSocket.CONNECTING = _OrigWebSocket.CONNECTING;
-      rawContent: getRawMessageContent(msg),
+  window.WebSocket.OPEN = _OrigWebSocket.OPEN;
   window.WebSocket.CLOSING = _OrigWebSocket.CLOSING;
   window.WebSocket.CLOSED = _OrigWebSocket.CLOSED;
 
