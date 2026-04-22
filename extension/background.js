@@ -1190,7 +1190,8 @@ async function prepareAndRunMessageBatch(payload) {
 
   await ensureAccountReady(account, 'Batch nhắn tin');
 
-  let tabId = await ensureMessageActionTab(account, { interactive: false });
+  const allowCreateTab = payload?.options?.allowCreateTab !== false;
+  let tabId = await ensureMessageActionTab(account, { interactive: false, allowCreateTab });
   let apiReady = await probeMessageApiReady(tabId);
 
   // Retry a few times before giving up — avoids creating extra windows.
