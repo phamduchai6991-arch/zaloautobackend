@@ -51,6 +51,11 @@ import {
   PLAN_LIMITS,
 } from './lib/accountStore.js';
 import {
+  ensureMessageHistorySchema,
+  listMessageHistory,
+  upsertMessageHistory,
+} from './lib/messageHistoryStore.js';
+import {
   handleAccountSync,
   handleSendBatch,
   handleFriendRequestBatch,
@@ -66,6 +71,173 @@ import { MuteAction, MuteDuration, ThreadType } from 'zalo-api-final';
 
 function writeNdjsonLine(res, data) {
   res.write(JSON.stringify(data) + '\n');
+}
+
+function normalizeHistoryTimestamp(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num) || num <= 0) return Date.now();
+  if (num < 1e12) return Math.floor(num * 1000);
+  return Math.floor(num);
+}
+
+function extractHistoryContent(value, depth = 0) {
+  if (depth > 4 || value == null) return '';
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return '';
+    if (text.startsWith('{') || text.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(text);
+        const nested = extractHistoryContent(parsed, depth + 1);
+        if (nested) return nested;
+      } catch (_) {
+        return text;
+      }
+    }
+    return text;
+  }
+  if (typeof value === 'number') return String(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nested = extractHistoryContent(item, depth + 1);
+      if (nested) return nested;
+    }
+    return '';
+  }
+  if (typeof value !== 'object') return '';
+
+  const direct = [
+    value.text,
+    value.content,
+    value.description,
+    value.title,
+    value.caption,
+    value.msg,
+    value.message,
+    value.body,
+    value.summary,
+  ];
+  for (const candidate of direct) {
+    const nested = extractHistoryContent(candidate, depth + 1);
+    if (nested) return nested;
+  }
+
+  const nestedCandidates = [
+    value.data,
+    value.params,
+    value.meta,
+    value.attach,
+    value.attachment,
+    value.attachments,
+    value.payload,
+    value.extra,
+    value.quote,
+  ];
+  for (const candidate of nestedCandidates) {
+    const nested = extractHistoryContent(candidate, depth + 1);
+    if (nested) return nested;
+  }
+
+  return '';
+}
+
+function normalizeHistoryMessage(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+
+  const fromId = String(raw.uidFrom || raw.fromUid || raw.fromId || raw.senderId || raw.uid || '').trim();
+  const toId = String(raw.idTo || raw.toId || raw.toUid || '').trim();
+  const msgId = String(raw.msgId || raw.globalMsgId || raw.actionId || raw.realMsgId || raw.cliMsgId || raw.id || '').trim();
+  if (!msgId) return null;
+
+  const content = String(raw.content || '').trim() || extractHistoryContent(raw.content) || extractHistoryContent(raw.rawContent) || extractHistoryContent(raw);
+
+  return {
+    msgId,
+    fromId,
+    toId,
+    content,
+    rawContent: raw.rawContent ?? raw,
+    ts: normalizeHistoryTimestamp(raw.ts || raw.sendDttm || raw.createTime || raw.time || 0),
+    msgType: String(raw.msgType || raw.type || 'text').trim() || 'text',
+    dName: String(raw.dName || raw.senderName || raw.fromName || raw.displayName || '').trim(),
+  };
+}
+
+function extractHistoryMessages(result) {
+  if (!result) return [];
+  if (Array.isArray(result)) return result;
+  if (typeof result !== 'object') return [];
+
+  if (Array.isArray(result.msgs)) return result.msgs;
+  if (Array.isArray(result.groupMsgs)) return result.groupMsgs;
+  if (Array.isArray(result.messages)) return result.messages;
+
+  if (result.data && typeof result.data === 'object') {
+    if (Array.isArray(result.data.msgs)) return result.data.msgs;
+    if (Array.isArray(result.data.groupMsgs)) return result.data.groupMsgs;
+    if (Array.isArray(result.data.messages)) return result.data.messages;
+  }
+
+  if (typeof result.data === 'string' && result.data.length > 2) {
+    try {
+      const parsed = JSON.parse(result.data);
+      if (Array.isArray(parsed?.msgs)) return parsed.msgs;
+      if (Array.isArray(parsed?.groupMsgs)) return parsed.groupMsgs;
+      if (Array.isArray(parsed?.messages)) return parsed.messages;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  return [];
+}
+
+function mergeHistoryMessages(...messageLists) {
+  const merged = [];
+  const seen = new Set();
+
+  for (const list of messageLists) {
+    for (const message of Array.isArray(list) ? list : []) {
+      const normalized = normalizeHistoryMessage(message);
+      if (!normalized) continue;
+      if (seen.has(normalized.msgId)) continue;
+      seen.add(normalized.msgId);
+      merged.push(normalized);
+    }
+  }
+
+  return merged.sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+}
+
+async function hydrateHistoryFromApi(api, { conversationId, isGroup, count }) {
+  const threadId = String(conversationId || '').trim();
+  if (!threadId) return [];
+
+  const strategies = [
+    async () => (typeof api.getMessageHistory === 'function' ? api.getMessageHistory(threadId, Boolean(isGroup), count) : null),
+    async () => (typeof api.getHistoryMessage === 'function' ? api.getHistoryMessage(threadId, count) : null),
+    async () => (typeof api.getCM === 'function' ? api.getCM(threadId, 0, 0, count, Date.now(), 10000, {}) : null),
+    async () => {
+      if (!isGroup || typeof api.getRecentGroup !== 'function') return null;
+      return api.getRecentGroup(threadId, 0, count);
+    },
+    async () => {
+      if (isGroup || typeof api.getLastMsgs !== 'function') return null;
+      return api.getLastMsgs(threadId, count);
+    },
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      const raw = await strategy();
+      const normalized = mergeHistoryMessages(extractHistoryMessages(raw));
+      if (normalized.length > 0) return normalized;
+    } catch (_) {
+      // ignore and try next strategy
+    }
+  }
+
+  return [];
 }
 
 async function handleSendBatchStream(req, res, body) {
@@ -1247,6 +1419,99 @@ const server = createServer(async (req, res) => {
         }
       }
 
+      // POST /api/zalo/history — DB-first message history with API hydration fallback
+      if (req.method === 'POST' && url === '/api/zalo/history') {
+        const body = await readBody(req);
+        let account = body?.account;
+        const conversationId = String(body?.threadId || body?.conversationId || '').trim();
+        const isGroup = Boolean(body?.isGroup);
+        const count = Math.max(1, Math.min(100, Number(body?.count) || 30));
+
+        if (!account) return writeJson(res, 400, { ok: false, error: 'Thiếu account.' });
+        if (!conversationId) return writeJson(res, 400, { ok: false, error: 'Thiếu conversationId/threadId.' });
+
+        // Enrich from DB if frontend sent incomplete account session.
+        try {
+          const hasCookies = Boolean(
+            (Array.isArray(account?.cookies) && account.cookies.length > 0) ||
+            (typeof account?.cookie === 'string' && account.cookie.trim()),
+          );
+          if (!hasCookies && account.ownerUserId && (account.id || account.zaloId || account.userId)) {
+            const zaloId = account.id || account.zaloId || account.userId;
+            const dbAccount = await getAccount(account.ownerUserId, zaloId);
+            if (dbAccount) Object.assign(account, dbAccount);
+          }
+        } catch (_) {}
+
+        const ownerUserId = String(account?.ownerUserId || '').trim();
+        const accountZaloId = String(account?.id || account?.zaloId || account?.userId || '').trim();
+
+        let cachedMessages = [];
+        if (ownerUserId && accountZaloId) {
+          try {
+            cachedMessages = await listMessageHistory({ ownerUserId, accountZaloId, conversationId, limit: count });
+          } catch (dbError) {
+            console.warn('[backend] listMessageHistory failed:', dbError.message);
+          }
+        }
+
+        const hasEnoughCache = cachedMessages.length >= Math.min(count, 10);
+        if (hasEnoughCache) {
+          return writeJson(res, 200, { ok: true, data: cachedMessages, source: 'db' });
+        }
+
+        const userAgent = getUserAgent(body, req);
+        let api;
+        try {
+          ({ api } = await createApiClient(account, userAgent));
+        } catch (error) {
+          if (cachedMessages.length > 0) {
+            return writeJson(res, 200, {
+              ok: true,
+              data: cachedMessages,
+              source: 'db-fallback',
+              warning: error instanceof Error ? error.message : 'Không thể hydrate từ API.',
+            });
+          }
+          return writeJson(res, 500, {
+            ok: false,
+            error: error instanceof Error ? error.message : 'Không thể khởi tạo phiên Zalo.',
+            code: 'SERVICE_LOGIN_FAILED',
+          });
+        }
+
+        let hydratedMessages = [];
+        try {
+          hydratedMessages = await hydrateHistoryFromApi(api, { conversationId, isGroup, count });
+        } catch (error) {
+          console.warn('[backend] hydrateHistoryFromApi failed:', error.message);
+        }
+
+        const mergedMessages = mergeHistoryMessages(cachedMessages, hydratedMessages);
+
+        if (ownerUserId && accountZaloId && hydratedMessages.length > 0) {
+          try {
+            await upsertMessageHistory({
+              ownerUserId,
+              accountZaloId,
+              conversationId,
+              isGroup,
+              messages: hydratedMessages,
+            });
+          } catch (dbError) {
+            console.warn('[backend] upsertMessageHistory failed:', dbError.message);
+          }
+        }
+
+        return writeJson(res, 200, {
+          ok: true,
+          data: mergedMessages,
+          source: hydratedMessages.length > 0
+            ? (cachedMessages.length > 0 ? 'db+api' : 'api')
+            : (cachedMessages.length > 0 ? 'db' : 'empty'),
+        });
+      }
+
       if (req.method === 'POST' && url === '/api/zalo/messages/batch') {
         const body = await readBody(req);
         return handleSendBatchStream(req, res, body);
@@ -1393,6 +1658,9 @@ server.listen(PORT, () => {
 
   // Ensure group library tables exist
   ensureGroupLibrarySchema().catch(() => {});
+
+  // Ensure message history cache table exists
+  ensureMessageHistorySchema().catch(() => {});
 });
 
 server.on('error', (error) => {
