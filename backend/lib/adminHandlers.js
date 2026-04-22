@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { getAllSubscriptions, getAllOrders, grantAdminSubscription } from './paymentStore.js';
 import { getAllUsers } from './userStore.js';
+import { getGuideContent, upsertGuideContent } from './guideContentStore.js';
 import {
   listCategories,
   createCategory,
@@ -94,6 +95,37 @@ function getAdminUsername(req) {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
   return decodeAdminToken(token)?.username || ADMIN_USERNAME;
+}
+
+function sanitizeGuideVideoUrls(videoUrls) {
+  const list = Array.isArray(videoUrls) ? videoUrls : [];
+  const out = [];
+  const seen = new Set();
+
+  for (const raw of list) {
+    const text = String(raw || '').trim();
+    if (!text) continue;
+
+    let parsed;
+    try {
+      parsed = new URL(text);
+    } catch {
+      continue;
+    }
+
+    const hostname = parsed.hostname.toLowerCase();
+    const isYoutubeHost = hostname.includes('youtube.com') || hostname.includes('youtu.be');
+    if (!isYoutubeHost) continue;
+
+    const normalized = parsed.toString();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+
+    if (out.length >= 20) break;
+  }
+
+  return out;
 }
 
 export function handleAdminLogin(req, res, body) {
@@ -252,6 +284,32 @@ export async function handleAdminOrders(req, res) {
   const orders = (await getAllOrders()).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ok: true, orders }));
+}
+
+export async function handleAdminGetGuideContent(req, res) {
+  if (!requireAdmin(req, res)) return;
+  const guide = await getGuideContent();
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, guide }));
+}
+
+export async function handleAdminUpdateGuideContent(req, res, body) {
+  if (!requireAdmin(req, res)) return;
+
+  const content = String(body?.content || '');
+  const videoUrls = sanitizeGuideVideoUrls(body?.videoUrls);
+
+  if (content.length > 100000) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Nội dung hướng dẫn quá dài (tối đa 100000 ký tự).' }));
+    return;
+  }
+
+  const adminUsername = getAdminUsername(req);
+  const guide = await upsertGuideContent({ content, videoUrls, updatedBy: adminUsername });
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, guide }));
 }
 
 export async function handleAdminGrantSubscription(req, res, body) {

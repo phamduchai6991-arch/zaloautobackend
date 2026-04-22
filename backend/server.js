@@ -16,6 +16,8 @@ import {
   handleAdminStats,
   handleAdminUsers,
   handleAdminOrders,
+  handleAdminGetGuideContent,
+  handleAdminUpdateGuideContent,
   handleAdminLogin,
   handleAdminGrantSubscription,
   handleAdminListCategories,
@@ -42,6 +44,7 @@ import {
   listGroups as publicListGroups,
   ensureGroupLibrarySchema,
 } from './lib/groupLibraryStore.js';
+import { ensureGuideContentSchema, getGuideContent } from './lib/guideContentStore.js';
 import {
   getAccount,
   getAccountsByUser,
@@ -1205,6 +1208,15 @@ const server = createServer(async (req, res) => {
         return handleAdminOrders(req, res);
       }
 
+      if (req.method === 'GET' && url === '/api/admin/guide-content') {
+        return handleAdminGetGuideContent(req, res);
+      }
+
+      if (req.method === 'PUT' && url === '/api/admin/guide-content') {
+        const body = await readBody(req);
+        return handleAdminUpdateGuideContent(req, res, body);
+      }
+
       if (req.method === 'POST' && url === '/api/admin/grant-subscription') {
         const body = await readBody(req);
         return handleAdminGrantSubscription(req, res, body);
@@ -1268,6 +1280,11 @@ const server = createServer(async (req, res) => {
         const search = fullUrl.searchParams.get('search') || undefined;
         const groups = await publicListGroups({ categoryId, search });
         return writeJson(res, 200, { ok: true, groups });
+      }
+
+      if (req.method === 'GET' && url === '/api/guide/content') {
+        const guide = await getGuideContent();
+        return writeJson(res, 200, { ok: true, guide });
       }
 
       // ─── Zalo account tracking (server-side limit enforcement) ───
@@ -1853,6 +1870,9 @@ server.listen(PORT, () => {
 
   // Ensure group library tables exist
   ensureGroupLibrarySchema().catch(() => {});
+
+  // Ensure guide content table exists
+  ensureGuideContentSchema().catch(() => {});
 
   // Ensure message history cache table exists
   ensureMessageHistorySchema().catch(() => {});
