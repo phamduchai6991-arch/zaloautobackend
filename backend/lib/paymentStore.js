@@ -92,19 +92,26 @@ export async function markOrderPaid(code, transactionId) {
   const now = new Date().toISOString();
   const result = await query(
     `UPDATE orders SET status = 'paid', paid_at = $2, transaction_id = $3
-     WHERE code = $1 AND status = 'pending'
+     WHERE code = $1 AND status IN ('pending', 'expired')
      RETURNING *`,
     [code, now, transactionId],
   );
   return rowToOrder(result.rows[0]);
 }
 
-export async function findPendingOrderByCode(transferContent) {
+export async function findPendingOrderByCode(transferContent, { includeRecentExpiredHours = 72 } = {}) {
   const normalized = (transferContent || '').toUpperCase().replace(/\s+/g, '');
   if (!normalized) return null;
 
+  const safeHours = Math.max(1, Math.min(24 * 30, Number(includeRecentExpiredHours) || 72));
+
   const result = await query(
-    `SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at DESC`,
+    `SELECT *
+       FROM orders
+      WHERE status = 'pending'
+         OR (status = 'expired' AND created_at >= NOW() - ($1 || ' hours')::INTERVAL)
+      ORDER BY created_at DESC`,
+    [String(safeHours)],
   );
 
   for (const row of result.rows) {
@@ -121,6 +128,17 @@ export async function cancelExpiredOrders(maxAgeMs = 24 * 60 * 60 * 1000) {
        AND created_at < NOW() - ($1 || ' seconds')::INTERVAL
      RETURNING code`,
     [String(intervalSec)],
+  );
+  return result.rowCount;
+}
+
+export async function expireElapsedSubscriptions() {
+  const result = await query(
+    `UPDATE subscriptions
+        SET status = 'expired', updated_at = NOW()
+      WHERE status = 'active'
+        AND expires_at < NOW()
+      RETURNING user_id`,
   );
   return result.rowCount;
 }
@@ -231,6 +249,7 @@ export async function getSubscription(userId, userEmail = '') {
 }
 
 export async function getAllSubscriptions() {
+  await expireElapsedSubscriptions();
   const result = await query('SELECT * FROM subscriptions ORDER BY updated_at DESC');
   return result.rows.map(rowToSub);
 }

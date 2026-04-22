@@ -54,6 +54,25 @@ function readBody(req) {
 const TIER_RANK = { basic: 1, plus: 2, pro: 3 };
 const PLAN_LABELS = { basic: 'BASIC', plus: 'PLUS', pro: 'PRO' };
 
+function resolveTransferContent(payload) {
+  return String(
+    payload?.content
+    || payload?.transferContent
+    || payload?.description
+    || payload?.desc
+    || payload?.note
+    || '',
+  ).trim();
+}
+
+function parseTransferAmount(value) {
+  if (typeof value === 'number') return value;
+  const text = String(value || '').trim();
+  if (!text) return NaN;
+  const normalized = text.replace(/[^0-9.-]/g, '');
+  return Number(normalized);
+}
+
 export async function handleCreateOrder(req, res, body) {
   const { userId, userEmail, planKey, period } = body || {};
 
@@ -186,7 +205,9 @@ export async function handleSepayWebhook(req, res, body) {
     return writeJson(res, 401, { ok: false, error: 'Invalid API key.' });
   }
 
-  const { id: transactionId, transferType, transferAmount, content, accountNumber } = body || {};
+  const { id: transactionId, transferType, transferAmount, accountNumber } = body || {};
+  const content = resolveTransferContent(body);
+  const numericAmount = parseTransferAmount(transferAmount);
 
   if (transferType !== 'in') {
     return writeJson(res, 200, { ok: true, message: 'Ignored: not an incoming transfer.' });
@@ -204,7 +225,7 @@ export async function handleSepayWebhook(req, res, body) {
     return writeJson(res, 200, { ok: true, message: 'No matching order found.' });
   }
 
-  if (Number(transferAmount) < order.amount) {
+  if (!Number.isFinite(numericAmount) || numericAmount < order.amount) {
     console.log(`[payment] Amount mismatch: got ${transferAmount}, expected ${order.amount} for ${order.code}`);
     return writeJson(res, 200, { ok: true, message: 'Amount insufficient.' });
   }
