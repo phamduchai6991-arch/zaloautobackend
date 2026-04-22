@@ -59,7 +59,7 @@ import {
 } from '../service/lib/handlers.js';
 import { requireAuthenticatedGoogleUser, createSessionToken, verifyGoogleIdToken, verifyGoogleAccessToken } from './lib/googleAuth.js';
 import { createApiClient, getUserAgent } from '../service/lib/apiClient.js';
-import { isGroupJob, normalizeThreadId, getDelayMs, sleep } from '../service/lib/zaloHelpers.js';
+import { isGroupJob, normalizeThreadId, getDelayMs, sleep, chunk, summarizeGroupMap } from '../service/lib/zaloHelpers.js';
 import { MuteAction, MuteDuration, ThreadType } from 'zalo-api-final';
 
 // ─── Streaming NDJSON helpers ────────────────────────────
@@ -1192,40 +1192,53 @@ const server = createServer(async (req, res) => {
 
         try {
           // Build conversation list from friends + groups (no browser tab needed)
-          // getAllFriends and getAllGroups are already tested and working
           const [friendsResult, groupsResult] = await Promise.allSettled([
             api.getAllFriends(),
             api.getAllGroups(),
           ]);
 
-          const friends = (friendsResult.status === 'fulfilled' && Array.isArray(friendsResult.value?.friends))
-            ? friendsResult.value.friends
-            : [];
-          const groups = (groupsResult.status === 'fulfilled' && Array.isArray(groupsResult.value?.groups))
-            ? groupsResult.value.groups
-            : [];
+          const friendsRaw = friendsResult.status === 'fulfilled' ? friendsResult.value : [];
+          const friends = Array.isArray(friendsRaw)
+            ? friendsRaw
+            : (Array.isArray(friendsRaw?.friends) ? friendsRaw.friends : []);
 
-          // Normalize to conversation shape
+          const groupsRaw = groupsResult.status === 'fulfilled' ? groupsResult.value : null;
+          const groupIds = Object.keys(groupsRaw?.gridVerMap || {})
+            .map((groupId) => normalizeThreadId(groupId, true))
+            .filter(Boolean);
+
+          const groups = [];
+          for (const ids of chunk(groupIds, 200)) {
+            if (!ids.length) continue;
+            const info = await api.getGroupInfo(ids);
+            groups.push(...summarizeGroupMap(info, new Set()));
+          }
+
+          // Normalize to conversation shape expected by frontend
           const friendConversations = friends.map((f) => ({
             id: String(f.userId || f.globalId || ''),
+            rawId: String(f.userId || f.globalId || ''),
             displayName: f.displayName || f.zaloName || f.username || 'Không rõ tên',
             avatar: f.avatar || '',
             isGroup: false,
             userId: String(f.userId || ''),
-          }));
+            lastMsgTime: Number(f.updatedTime || f.actionTime || 0) || 0,
+          })).filter((item) => item.id);
 
           const groupConversations = groups.map((g) => ({
-            id: String(g.groupId || g.userId || g.id || ''),
-            displayName: g.name || g.fullName || g.displayName || 'Nhóm không rõ tên',
-            avatar: g.avt || g.avatar || '',
+            id: String(g.userId || g.groupId || ''),
+            rawId: String(g.userId || g.groupId || ''),
+            displayName: g.displayName || 'Nhóm không rõ tên',
+            avatar: g.avatar || '',
             isGroup: true,
-            memberCount: g.totalMember || 0,
-          }));
+            memberCount: Number(g.totalMember || 0),
+            lastMsgTime: 0,
+          })).filter((item) => item.id);
 
-          return writeJson(res, 200, {
-            ok: true,
-            data: [...friendConversations, ...groupConversations],
-          });
+          const data = [...friendConversations, ...groupConversations]
+            .sort((a, b) => Number(b.lastMsgTime || 0) - Number(a.lastMsgTime || 0));
+
+          return writeJson(res, 200, { ok: true, data });
         } catch (error) {
           return writeJson(res, 500, {
             ok: false,
