@@ -111,11 +111,30 @@ function sanitizeGuideVideoEmbedUrl(rawValue) {
     return '';
   }
 
-  const hostname = parsed.hostname.toLowerCase();
-  const isYoutubeHost = hostname.includes('youtube.com') || hostname.includes('youtu.be');
-  if (!isYoutubeHost) return '';
+  const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  const path = parsed.pathname;
 
-  return parsed.toString();
+  const buildEmbed = (id) => {
+    const videoId = String(id || '').trim();
+    return videoId ? `https://www.youtube.com/embed/${videoId}` : '';
+  };
+
+  if (hostname === 'youtu.be') {
+    const id = path.split('/').filter(Boolean)[0] || '';
+    return buildEmbed(id);
+  }
+
+  if (hostname.endsWith('youtube.com') || hostname.endsWith('youtube-nocookie.com')) {
+    const watchId = parsed.searchParams.get('v');
+    if (watchId) return buildEmbed(watchId);
+
+    const segments = path.split('/').filter(Boolean);
+    if (segments.length >= 2 && ['embed', 'shorts', 'live'].includes(segments[0])) {
+      return buildEmbed(segments[1]);
+    }
+  }
+
+  return '';
 }
 
 export function handleAdminLogin(req, res, body) {
