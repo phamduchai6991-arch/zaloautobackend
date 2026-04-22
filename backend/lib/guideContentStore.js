@@ -23,9 +23,9 @@ export async function ensureGuideContentSchema() {
 
 function normalizeGuideRecord(row) {
   const payload = row?.content_json && typeof row.content_json === 'object' ? row.content_json : {};
+  const legacyVideoUrls = Array.isArray(payload.videoUrls) ? payload.videoUrls.map((url) => String(url || '').trim()).filter(Boolean) : [];
   return {
-    content: String(payload.content || ''),
-    videoUrls: Array.isArray(payload.videoUrls) ? payload.videoUrls.map((url) => String(url || '').trim()).filter(Boolean) : [],
+    videoEmbedUrl: String(payload.videoEmbedUrl || legacyVideoUrls[0] || ''),
     updatedAt: row?.updated_at?.toISOString?.() || row?.updated_at || null,
     updatedBy: String(row?.updated_by || payload.updatedBy || 'admin'),
   };
@@ -42,8 +42,7 @@ export async function getGuideContent() {
 
   if (!result.rows[0]) {
     return {
-      content: '',
-      videoUrls: [],
+      videoEmbedUrl: '',
       updatedAt: null,
       updatedBy: 'admin',
     };
@@ -52,12 +51,11 @@ export async function getGuideContent() {
   return normalizeGuideRecord(result.rows[0]);
 }
 
-export async function upsertGuideContent({ content = '', videoUrls = [], updatedBy = 'admin' }) {
+export async function upsertGuideContent({ videoEmbedUrl = '', updatedBy = 'admin' }) {
   await ensureGuideContentSchema();
 
   const payload = {
-    content: String(content || ''),
-    videoUrls: Array.isArray(videoUrls) ? videoUrls.map((url) => String(url || '').trim()).filter(Boolean) : [],
+    videoEmbedUrl: String(videoEmbedUrl || '').trim(),
     updatedBy: String(updatedBy || 'admin'),
   };
 

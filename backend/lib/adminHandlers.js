@@ -97,35 +97,25 @@ function getAdminUsername(req) {
   return decodeAdminToken(token)?.username || ADMIN_USERNAME;
 }
 
-function sanitizeGuideVideoUrls(videoUrls) {
-  const list = Array.isArray(videoUrls) ? videoUrls : [];
-  const out = [];
-  const seen = new Set();
+function sanitizeGuideVideoEmbedUrl(rawValue) {
+  const text = String(rawValue || '').trim();
+  if (!text) return '';
 
-  for (const raw of list) {
-    const text = String(raw || '').trim();
-    if (!text) continue;
+  const iframeMatch = text.match(/<iframe[^>]+src=["']([^"']+)["']/i);
+  const candidate = iframeMatch?.[1] ? iframeMatch[1].trim() : text;
 
-    let parsed;
-    try {
-      parsed = new URL(text);
-    } catch {
-      continue;
-    }
-
-    const hostname = parsed.hostname.toLowerCase();
-    const isYoutubeHost = hostname.includes('youtube.com') || hostname.includes('youtu.be');
-    if (!isYoutubeHost) continue;
-
-    const normalized = parsed.toString();
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
-    out.push(normalized);
-
-    if (out.length >= 20) break;
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return '';
   }
 
-  return out;
+  const hostname = parsed.hostname.toLowerCase();
+  const isYoutubeHost = hostname.includes('youtube.com') || hostname.includes('youtu.be');
+  if (!isYoutubeHost) return '';
+
+  return parsed.toString();
 }
 
 export function handleAdminLogin(req, res, body) {
@@ -296,17 +286,16 @@ export async function handleAdminGetGuideContent(req, res) {
 export async function handleAdminUpdateGuideContent(req, res, body) {
   if (!requireAdmin(req, res)) return;
 
-  const content = String(body?.content || '');
-  const videoUrls = sanitizeGuideVideoUrls(body?.videoUrls);
+  const videoEmbedUrl = sanitizeGuideVideoEmbedUrl(body?.videoEmbedUrl);
 
-  if (content.length > 100000) {
+  if (body?.videoEmbedUrl && !videoEmbedUrl) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: false, error: 'Nội dung hướng dẫn quá dài (tối đa 100000 ký tự).' }));
+    res.end(JSON.stringify({ ok: false, error: 'Link hoặc iframe YouTube không hợp lệ.' }));
     return;
   }
 
   const adminUsername = getAdminUsername(req);
-  const guide = await upsertGuideContent({ content, videoUrls, updatedBy: adminUsername });
+  const guide = await upsertGuideContent({ videoEmbedUrl, updatedBy: adminUsername });
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ok: true, guide }));
