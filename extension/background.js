@@ -7,6 +7,7 @@ let pendingLoginTabId = null;  // Tab in incognito with chat.zalo.me
 let closingWindowIds = new Set();
 let pendingFinalizeTimer = null;
 let pendingReextractTimer = null;
+let pendingAutoConfirmTimer = null;
 let pendingReextractCount = 0;
 let lastKnownLoginData = null;
 let messageActionTabId = null;
@@ -21,6 +22,7 @@ let syncState = {
   error: '',
   startedAt: null,
 };
+const AUTO_CONFIRM_DELAY_MS = 1500;
 
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -171,6 +173,10 @@ function clearPendingTimers() {
     clearTimeout(pendingReextractTimer);
     pendingReextractTimer = null;
   }
+  if (pendingAutoConfirmTimer) {
+    clearTimeout(pendingAutoConfirmTimer);
+    pendingAutoConfirmTimer = null;
+  }
 }
 
 function resetPendingSession() {
@@ -282,6 +288,34 @@ async function stagePendingAccountSync(accountData, windowId) {
     summary,
     error: '',
   });
+
+  // Auto-confirm shortly after session capture so users do not need manual clicks.
+  if (pendingAutoConfirmTimer) {
+    clearTimeout(pendingAutoConfirmTimer);
+  }
+
+  pendingAutoConfirmTimer = setTimeout(async () => {
+    pendingAutoConfirmTimer = null;
+
+    if (!pendingAccountSync || pendingAccountSync.requestId !== requestId) {
+      return;
+    }
+
+    try {
+      await confirmAccountSync(requestId);
+    } catch (error) {
+      // Keep manual confirmation available when auto-confirm cannot complete.
+      if (!pendingAccountSync || pendingAccountSync.requestId !== requestId) {
+        return;
+      }
+
+      await broadcastSyncState('awaiting_sync_confirmation', {
+        requestId,
+        summary,
+        error: 'Tự động đồng bộ chưa thành công. Bạn có thể bấm "Xác nhận đồng bộ" để thử lại.',
+      });
+    }
+  }, AUTO_CONFIRM_DELAY_MS);
 }
 
 async function confirmAccountSync(requestId) {
