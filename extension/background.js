@@ -12,6 +12,7 @@ let pendingReextractCount = 0;
 let lastKnownLoginData = null;
 let messageActionTabId = null;
 let messageActionManagedWindowId = null;
+let activeMessageBatch = null;
 let loginCompleted = false;    // Track whether login succeeded before window closes
 let pendingAccountSync = null;
 let syncState = {
@@ -464,6 +465,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .catch((e) => sendResponse({ ok: false, error: e.message }));
       return true;
 
+    case 'STOP_MESSAGE_BATCH':
+      try {
+        assertTrustedWebAppSender(sender, 'Dừng batch tin nhắn');
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message });
+        return false;
+      }
+      stopMessageBatch(message.data?.reason)
+        .then((result) => sendResponse(result))
+        .catch((e) => sendResponse({ ok: false, error: e.message }));
+      return true;
+
     case 'Z_GET_COMMON_DATA':
       try {
         assertTrustedWebAppSender(sender, 'Lấy dữ liệu phiên Zalo');
@@ -489,6 +502,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
 
     case 'ZALO_MESSAGE_JOB_EVENT':
+      applyMessageBatchProgress(String(message.data?.jobId || ''), message.data?.changes?.status);
       broadcastToWebApps('ZALOTOOL_MESSAGE_JOB_UPDATE', message.data).then(() => sendResponse({ ok: true }))
         .catch((e) => sendResponse({ ok: false, error: e.message }));
       return true;
@@ -673,6 +687,63 @@ async function failMessageJobs(jobs, errorMessage) {
       failedAt: new Date().toISOString(),
     });
   }
+}
+
+function trackActiveMessageBatch(jobs, tabId) {
+  const pendingJobIds = new Set(
+    (Array.isArray(jobs) ? jobs : [])
+      .map((job) => String(job?.id || '').trim())
+      .filter(Boolean),
+  );
+
+  activeMessageBatch = {
+    tabId,
+    pendingJobIds,
+    startedAt: Date.now(),
+  };
+}
+
+function applyMessageBatchProgress(jobId, status) {
+  if (!activeMessageBatch || !jobId) return;
+
+  if (activeMessageBatch.pendingJobIds.has(jobId)) {
+    const terminalStatuses = new Set(['sent', 'failed', 'completed', 'skipped', 'accepted', 'pending', 'stopped']);
+    if (terminalStatuses.has(String(status || '').trim())) {
+      activeMessageBatch.pendingJobIds.delete(jobId);
+    }
+  }
+
+  if (activeMessageBatch.pendingJobIds.size === 0) {
+    activeMessageBatch = null;
+  }
+}
+
+async function stopMessageBatch(reason = 'Người dùng đã dừng batch.') {
+  const batch = activeMessageBatch;
+  if (!batch) {
+    return { ok: true, stopped: 0, message: 'Không có batch nhắn tin nào đang chạy.' };
+  }
+
+  try {
+    if (batch.tabId != null) {
+      await tabsSendMessage(batch.tabId, { type: 'ZALOTOOL_STOP_MESSAGE_BATCH', data: { reason } });
+    }
+  } catch (_) {
+    // Ignore transport errors and still update UI state below.
+  }
+
+  const remainingJobIds = Array.from(batch.pendingJobIds);
+  for (const jobId of remainingJobIds) {
+    await broadcastMessageJobUpdate(jobId, {
+      status: 'stopped',
+      statusLabel: 'Đã dừng',
+      error: reason,
+      failedAt: new Date().toISOString(),
+    });
+  }
+
+  activeMessageBatch = null;
+  return { ok: true, stopped: remainingJobIds.length };
 }
 
 async function finalizePendingLogin(reason) {
@@ -1283,12 +1354,25 @@ async function startMessageBatch(payload) {
     return { ok: false, error: 'Không có thông tin tài khoản để khởi chạy batch nhắn tin.' };
   }
 
+  if (activeMessageBatch) {
+    return { ok: false, error: 'Đang có batch nhắn tin khác chạy. Hãy dừng batch hiện tại trước khi chạy lại.' };
+  }
+
   await ensureAccountReady(account, 'Batch nhắn tin');
+
+  let tabId = null;
+  try {
+    tabId = await ensureMessageActionTab(account);
+  } catch (_) {
+    tabId = null;
+  }
+  trackActiveMessageBatch(jobs, tabId);
 
   Promise.resolve()
     .then(() => prepareAndRunMessageBatch(payload))
     .catch(async (error) => {
       console.error('[ZaloTool BG] Failed to start message batch:', error);
+      activeMessageBatch = null;
       await failMessageJobs(jobs, error.message);
     });
 

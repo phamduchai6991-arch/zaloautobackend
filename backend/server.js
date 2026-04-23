@@ -338,6 +338,11 @@ async function handleSendBatchStream(req, res, body) {
     'Cache-Control': 'no-cache',
   });
 
+  let clientClosed = false;
+  req.on('close', () => {
+    clientClosed = true;
+  });
+
   // Convert base64 files to Buffer attachments (shared across all jobs)
   const rawFiles = Array.isArray(body?.files) ? body.files : [];
   const attachments = rawFiles
@@ -353,6 +358,8 @@ async function handleSendBatchStream(req, res, body) {
   let templateCounter = 0;
 
   for (let index = 0; index < jobs.length; index += 1) {
+    if (clientClosed || res.writableEnded) break;
+
     const job = jobs[index];
     const groupJob = isGroupJob(job);
     const zid = normalizeThreadId(job?.zid, groupJob);
@@ -465,13 +472,16 @@ async function handleSendBatchStream(req, res, body) {
     }
 
     if (index < jobs.length - 1) {
+      if (clientClosed || res.writableEnded) break;
       const delayMs = getDelayMs(job?.delayWindow);
       if (delayMs > 0) await sleep(delayMs);
     }
   }
 
-  writeNdjsonLine(res, { _done: true, ok: true, accepted, failed });
-  res.end();
+  if (!clientClosed && !res.writableEnded) {
+    writeNdjsonLine(res, { _done: true, ok: true, accepted, failed });
+    res.end();
+  }
 }
 
 async function handleFriendRequestBatchStream(req, res, body) {
@@ -510,12 +520,19 @@ async function handleFriendRequestBatchStream(req, res, body) {
     'Cache-Control': 'no-cache',
   });
 
+  let clientClosed = false;
+  req.on('close', () => {
+    clientClosed = true;
+  });
+
   let accepted = 0;
   let failed = 0;
   let templateIdx = 0;
   let templateCounter = 0;
 
   for (let index = 0; index < jobs.length; index += 1) {
+    if (clientClosed || res.writableEnded) break;
+
     const job = jobs[index];
     const userId = String(job?.zid || '').trim();
     // Use rotating templates if provided, else job.note
@@ -589,13 +606,16 @@ async function handleFriendRequestBatchStream(req, res, body) {
     }
 
     if (index < jobs.length - 1) {
+      if (clientClosed || res.writableEnded) break;
       const delayMs = getDelayMs(job?.delayWindow);
       if (delayMs > 0) await sleep(delayMs);
     }
   }
 
-  writeNdjsonLine(res, { _done: true, ok: true, accepted, failed });
-  res.end();
+  if (!clientClosed && !res.writableEnded) {
+    writeNdjsonLine(res, { _done: true, ok: true, accepted, failed });
+    res.end();
+  }
 }
 
 // ─── Rotation: round-robin friend requests across multiple accounts ─────
@@ -642,6 +662,11 @@ async function handleFriendRequestRotateStream(req, res, body) {
     'Cache-Control': 'no-cache',
   });
 
+  let clientClosed = false;
+  req.on('close', () => {
+    clientClosed = true;
+  });
+
   // Report failed account initializations
   for (const c of clients) {
     if (!c.api) {
@@ -657,6 +682,8 @@ async function handleFriendRequestRotateStream(req, res, body) {
   let templateCounter = 0; // requests since last message rotation
 
   for (let index = 0; index < jobs.length; index += 1) {
+    if (clientClosed || res.writableEnded) break;
+
     const job = jobs[index];
     const userId = String(job?.zid || '').trim();
 
@@ -756,13 +783,16 @@ async function handleFriendRequestRotateStream(req, res, body) {
     }
 
     if (index < jobs.length - 1) {
+      if (clientClosed || res.writableEnded) break;
       const delayMs = getDelayMs(job?.delayWindow);
       if (delayMs > 0) await sleep(delayMs);
     }
   }
 
-  writeNdjsonLine(res, { _done: true, ok: true, accepted, failed, rotationAccountCount: liveClients.length });
-  res.end();
+  if (!clientClosed && !res.writableEnded) {
+    writeNdjsonLine(res, { _done: true, ok: true, accepted, failed, rotationAccountCount: liveClients.length });
+    res.end();
+  }
 }
 
 async function handleActionBatchStream(req, res, body) {
@@ -799,6 +829,11 @@ async function handleActionBatchStream(req, res, body) {
     'Cache-Control': 'no-cache',
   });
 
+  let clientClosed = false;
+  req.on('close', () => {
+    clientClosed = true;
+  });
+
   let accepted = 0;
   let failed = 0;
 
@@ -815,6 +850,8 @@ async function handleActionBatchStream(req, res, body) {
   };
 
   for (let index = 0; index < jobs.length; index += 1) {
+    if (clientClosed || res.writableEnded) break;
+
     const job = jobs[index];
     const actionType = String(job?.actionType || '').trim();
     const groupJob = isGroupJob(job);
@@ -935,13 +972,16 @@ async function handleActionBatchStream(req, res, body) {
     }
 
     if (index < jobs.length - 1) {
+      if (clientClosed || res.writableEnded) break;
       const delayMs = getDelayMs(job?.delayWindow);
       if (delayMs > 0) await sleep(delayMs);
     }
   }
 
-  writeNdjsonLine(res, { _done: true, ok: true, accepted, failed });
-  res.end();
+  if (!clientClosed && !res.writableEnded) {
+    writeNdjsonLine(res, { _done: true, ok: true, accepted, failed });
+    res.end();
+  }
 }
 
 // Load .env file

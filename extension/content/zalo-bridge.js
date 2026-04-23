@@ -10,6 +10,7 @@
   var collected = { me: null, friends: null, groups: null, session: null };
   var sent = false;
   var messageBatchRunning = false;
+  var messageBatchStopRequested = false;
   var apiAvailable = false; // Set true when zalo-main.js reports API is ready
 
   function runtimeSendMessage(message) {
@@ -32,6 +33,17 @@
     return new Promise(function (resolve) {
       setTimeout(resolve, ms);
     });
+  }
+
+  async function sleepWithStop(ms) {
+    var remaining = Number(ms || 0);
+    while (remaining > 0) {
+      if (messageBatchStopRequested) return false;
+      var step = Math.min(remaining, 250);
+      await sleep(step);
+      remaining -= step;
+    }
+    return !messageBatchStopRequested;
   }
 
   function normalizeText(value) {
@@ -882,8 +894,13 @@
     }
 
     messageBatchRunning = true;
+    messageBatchStopRequested = false;
     try {
       for (var index = 0; index < jobs.length; index += 1) {
+        if (messageBatchStopRequested) {
+          break;
+        }
+
         var job = jobs[index];
         await reportJobUpdate(job.id, {
           status: 'running',
@@ -908,13 +925,15 @@
         }
 
         if (index < jobs.length - 1) {
-          await sleep(getMessageDelay(job.delayWindow));
+          var shouldContinue = await sleepWithStop(getMessageDelay(job.delayWindow));
+          if (!shouldContinue) break;
         }
       }
 
-      return { ok: true };
+      return { ok: true, cancelled: messageBatchStopRequested === true };
     } finally {
       messageBatchRunning = false;
+      messageBatchStopRequested = false;
     }
   }
 
@@ -971,6 +990,12 @@
       runMessageBatch(Array.isArray(msg.data?.jobs) ? msg.data.jobs : []).catch(function () {
         // Job-level failures are already reported individually back to the web app.
       });
+      sendResponse({ ok: true });
+      return false;
+    }
+
+    if (msg.type === 'ZALOTOOL_STOP_MESSAGE_BATCH') {
+      messageBatchStopRequested = true;
       sendResponse({ ok: true });
       return false;
     }
