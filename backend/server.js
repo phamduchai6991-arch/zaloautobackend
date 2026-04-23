@@ -64,6 +64,7 @@ import {
   handleSendBatch,
   handleFriendRequestBatch,
   handleGroupInviteTargets,
+  handleFindUser,
   handleActionBatch,
   ensureCustomApiActions,
 } from '../service/lib/handlers.js';
@@ -1796,6 +1797,33 @@ const server = createServer(async (req, res) => {
         }
         body.accounts = rotAccounts;
         return handleFriendRequestRotateStream(req, res, body);
+      }
+
+      if (req.method === 'POST' && url === '/api/zalo/find-users') {
+        const body = await readBody(req);
+        // Enrich account from DB if frontend sent incomplete session data
+        try {
+          const acct = body?.account;
+          const hasCookies = Boolean(
+            (Array.isArray(acct?.cookies) && acct.cookies.length > 0) ||
+            (typeof acct?.cookie === 'string' && acct.cookie.trim()),
+          );
+          if (acct && !hasCookies && acct.ownerUserId && (acct.id || acct.zaloId || acct.userId)) {
+            const zaloId = acct.id || acct.zaloId || acct.userId;
+            const dbAccount = await getAccount(acct.ownerUserId, zaloId);
+            if (dbAccount) {
+              body.account = { ...dbAccount, ...acct, cookie: dbAccount.cookie, cookies: dbAccount.cookies, imei: dbAccount.imei || acct.imei, decryptKey: dbAccount.decryptKey || acct.decryptKey, commonParams: dbAccount.commonParams || acct.commonParams, UIN: dbAccount.UIN || acct.UIN, sessionSource: dbAccount.sessionSource || acct.sessionSource };
+            }
+          }
+        } catch (enrichErr) {
+          console.warn('[backend] Account enrichment from DB failed (find-users):', enrichErr.message);
+        }
+        try {
+          return await handleFindUser(req, res, body);
+        } catch (handlerErr) {
+          console.error('[backend] find-users handler crashed:', handlerErr);
+          return writeJson(res, 500, { ok: false, error: handlerErr?.message || 'Lỗi tra cứu SĐT/ZID.' });
+        }
       }
 
       if (req.method === 'POST' && url === '/api/zalo/groups/invite-targets') {
