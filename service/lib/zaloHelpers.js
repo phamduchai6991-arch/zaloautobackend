@@ -140,6 +140,10 @@ export function summarizeGroupMap(groupInfo, hiddenGroupIds = new Set()) {
     globalId: group.globalId || '',
     type: group.type,
     subType: group.subType,
+    updatedTime: group.updatedTime || group.actionTime || group.lastMsgTime || group.lastActionTime || 0,
+    actionTime: group.actionTime || group.updatedTime || 0,
+    lastMsgTime: group.lastMsgTime || group.updatedTime || group.actionTime || 0,
+    lastMessage: group.lastMessage || group.lastMsg || group.lastContent || group.desc || '',
     isHiddenConversation: hiddenGroupIds.has(String(group.groupId || '').trim()),
   }));
 }

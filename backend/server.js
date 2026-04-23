@@ -1507,8 +1507,8 @@ const server = createServer(async (req, res) => {
             avatar: g.avatar || '',
             isGroup: true,
             memberCount: Number(g.totalMember || 0),
-            lastMessage: String(g.desc || '').trim() || '',
-            lastMsgTime: 0,
+            lastMessage: String(g.lastMessage || g.lastMsg || g.desc || '').trim() || '',
+            lastMsgTime: Number(g.updatedTime || g.actionTime || g.lastMsgTime || g.lastActionTime || 0) || 0,
           })).filter((item) => item.id);
 
           const ownerUserId = String(account?.ownerUserId || '').trim();
@@ -1562,6 +1562,7 @@ const server = createServer(async (req, res) => {
         const conversationId = String(body?.threadId || body?.conversationId || '').trim();
         const isGroup = Boolean(body?.isGroup);
         const count = Math.max(1, Math.min(100, Number(body?.count) || 30));
+        const forceHydrate = body?.forceHydrate === true;
 
         if (!account) return writeJson(res, 400, { ok: false, error: 'Thiếu account.' });
         if (!conversationId) return writeJson(res, 400, { ok: false, error: 'Thiếu conversationId/threadId.' });
@@ -1592,7 +1593,7 @@ const server = createServer(async (req, res) => {
         }
 
         const hasEnoughCache = cachedMessages.length >= Math.min(count, 10);
-        if (hasEnoughCache) {
+        if (hasEnoughCache && !forceHydrate) {
           return writeJson(res, 200, { ok: true, data: cachedMessages, source: 'db' });
         }
 
