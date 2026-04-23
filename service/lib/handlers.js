@@ -334,22 +334,28 @@ export async function handleAccountSync(req, res, body) {
       .map((thread) => normalizeThreadId(thread?.thread_id, true))
       .filter(Boolean),
   );
-  const groupChunks = chunk(groupIds, 200);
+  const groupChunks = chunk(groupIds, 200).filter((ids) => ids.length > 0);
+  const groupChunkResults = await Promise.allSettled(
+    groupChunks.map((ids) => api.getGroupInfo(ids)),
+  );
   const groups = [];
-
-  for (const ids of groupChunks) {
-    if (!ids.length) continue;
-    const info = await api.getGroupInfo(ids);
-    groups.push(...summarizeGroupMap(info, hiddenGroupIdSet));
+  for (const result of groupChunkResults) {
+    if (result.status === 'fulfilled') {
+      groups.push(...summarizeGroupMap(result.value, hiddenGroupIdSet));
+    }
   }
 
   const knownGroupIds = new Set(groups.map((group) => String(group?.userId || '').trim()).filter(Boolean));
   const missingHiddenGroupIds = Array.from(hiddenGroupIdSet).filter((groupId) => !knownGroupIds.has(groupId));
 
-  for (const ids of chunk(missingHiddenGroupIds, 200)) {
-    if (!ids.length) continue;
-    const info = await safeApiCall(() => api.getGroupInfo(ids), { gridInfoMap: {} });
-    groups.push(...summarizeGroupMap(info, hiddenGroupIdSet));
+  const missingChunks = chunk(missingHiddenGroupIds, 200).filter((ids) => ids.length > 0);
+  const missingChunkResults = await Promise.allSettled(
+    missingChunks.map((ids) => safeApiCall(() => api.getGroupInfo(ids), { gridInfoMap: {} })),
+  );
+  for (const result of missingChunkResults) {
+    if (result.status === 'fulfilled') {
+      groups.push(...summarizeGroupMap(result.value, hiddenGroupIdSet));
+    }
   }
 
   writeJson(res, 200, {
