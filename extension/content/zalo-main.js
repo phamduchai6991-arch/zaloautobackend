@@ -320,7 +320,7 @@
       try {
         db = await withTimeout(openIndexedDb(dbMeta.name, dbMeta.version), 1000, null);
         if (!db) continue;
-        var groups = await withTimeout(readStore(db, 'group'), 1000, []);
+        var groups = await withTimeout(readStore(db, 'group'), 2000, []);
         allGroups = allGroups.concat(groups);
       } catch (_) {
         // Ignore unrelated databases.
@@ -354,7 +354,7 @@
 
     var conversations = [];
     try {
-      conversations = await withTimeout(zs.getConversations(), 1500, []);
+      conversations = await withTimeout(zs.getConversations(), 3000, []);
     } catch (_) {
       return [];
     }
@@ -371,18 +371,13 @@
   async function collectGroups(zs) {
     var directGroups = [];
     try {
-      directGroups = toArray(await withTimeout(zs.getGroups(), 1500, []));
+      directGroups = toArray(await withTimeout(zs.getGroups(), 4000, []));
     } catch (_) {}
 
-    var indexedDbGroups = [];
-    if (!directGroups.length) {
-      indexedDbGroups = await collectIndexedDbGroups();
-    }
-
-    var conversationGroups = [];
-    if (!directGroups.length && !indexedDbGroups.length) {
-      conversationGroups = await collectConversationGroups(zs);
-    }
+    // Always merge multiple sources because getGroups() can be partial
+    // for large accounts (many groups) depending on current cache state.
+    var indexedDbGroups = await collectIndexedDbGroups();
+    var conversationGroups = await collectConversationGroups(zs);
 
     return dedupeBy(
       directGroups
