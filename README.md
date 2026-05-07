@@ -81,6 +81,8 @@ npm run dev
 | `ADMIN_USERNAME` | `backend/.env` | Username đăng nhập trang /admin |
 | `ADMIN_SECRET` | `backend/.env` | Password trang /admin |
 | `ZALOWEB_ALLOWED_ORIGINS` | env | CORS origins, phân cách bằng dấu phẩy |
+| `GOOGLE_CLIENT_IDS` | `backend/.env` | Danh sách Google Client ID hợp lệ (phân cách dấu phẩy) |
+| `SESSION_SECRET` | `backend/.env` | Secret ký token phiên nội bộ (bắt buộc set trên production) |
 | `FRONTEND_DIST_DIR` | env | Path tới built frontend dist (optional) |
 
 ---
@@ -229,6 +231,8 @@ cp backend/.env.example backend/.env              # cấu hình secrets
 | `ADMIN_USERNAME` | `backend/.env` | Admin username for `/admin` login |
 | `ADMIN_SECRET` | `backend/.env` | Admin password secret |
 | `ZALOWEB_ALLOWED_ORIGINS` | env | Trusted origins for CORS, comma-separated |
+| `GOOGLE_CLIENT_IDS` | `backend/.env` | Trusted Google OAuth client IDs, comma-separated |
+| `SESSION_SECRET` | `backend/.env` | Secret for signing persistent app session tokens |
 | `FRONTEND_DIST_DIR` | env | Optional absolute or relative path to built frontend dist |
 
 ## Deployment

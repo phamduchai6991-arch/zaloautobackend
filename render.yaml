@@ -17,5 +17,7 @@ services:
         sync: false
       - key: ZALOWEB_ALLOWED_ORIGINS
         sync: false
+      - key: GOOGLE_CLIENT_IDS
+        sync: false
       - key: SESSION_SECRET
         sync: false

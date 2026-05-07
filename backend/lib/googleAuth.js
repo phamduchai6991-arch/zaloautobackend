@@ -1,8 +1,19 @@
 import { createHmac, randomBytes } from 'node:crypto';
 
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID
-  || process.env.VITE_GOOGLE_CLIENT_ID
-  || '926356775578-bpfirprc4vbi9n4o3fhubi9p7ddksigs.apps.googleusercontent.com';
+function parseClientIds(raw) {
+  return String(raw || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+const configuredGoogleClientIds = [
+  ...parseClientIds(process.env.GOOGLE_CLIENT_IDS),
+  ...parseClientIds(process.env.GOOGLE_CLIENT_ID),
+  ...parseClientIds(process.env.VITE_GOOGLE_CLIENT_ID),
+];
+
+const GOOGLE_CLIENT_IDS = [...new Set(configuredGoogleClientIds)];
 
 // Secret for signing session tokens — generated once per process lifetime.
 // In production, set SESSION_SECRET env var for persistence across deploys.
@@ -46,8 +57,8 @@ export async function verifyGoogleIdToken(token) {
   if (!data?.sub) {
     throw new Error('Không xác thực được tài khoản Google.');
   }
-  if (GOOGLE_CLIENT_ID && data.aud && data.aud !== GOOGLE_CLIENT_ID) {
-    throw new Error('Google token không thuộc ứng dụng này.');
+  if (GOOGLE_CLIENT_IDS.length > 0 && data.aud && !GOOGLE_CLIENT_IDS.includes(String(data.aud))) {
+    throw new Error('Google token không thuộc ứng dụng này (sai Client ID).');
   }
 
   return {
